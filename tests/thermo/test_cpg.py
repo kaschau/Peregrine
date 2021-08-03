@@ -27,6 +27,7 @@ def test_cpg():
 
     config = pg.files.config_file()
     config['thermochem']['ctfile'] = ctfile
+    config['thermochem']['eos'] = 'cpg'
 
     mb = pg.multiblock.generate_multiblock_solver(1,config)
     therm = pg.thermo.thermdat(config)
