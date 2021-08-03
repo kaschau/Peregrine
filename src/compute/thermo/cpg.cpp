@@ -37,7 +37,7 @@ void cpg(block_ b,
   double rho,rhoinv;
   double rhou,rhov,rhow;
   double e,rhoE;
-  double rhoY[th.ns];
+  double rhoY[ns];
   double gamma,cp=0.0,h;
   double Rmix=0.0;
 
@@ -189,7 +189,7 @@ void cpg(block_ b,
   // gamma,cp,h
   b.qh(i,j,k,0) = gamma;
   b.qh(i,j,k,1) = cp;
-  b.qh(i,j,k,2) = h;
+  b.qh(i,j,k,2) = rho*h;
 
   });
   }
