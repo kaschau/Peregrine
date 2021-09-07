@@ -17,6 +17,7 @@ def test_tpg():
 
     relpath = str(Path(__file__).parent)
     ctfile = relpath+'/ct_test_tpg.yaml'
+    thfile = relpath+'/thtr_ct_test_tpg.yaml'
     gas = ct.Solution(ctfile)
     p = np.random.uniform(low=10000, high=100000)
     T = np.random.uniform(low=100  , high=1000)
@@ -26,7 +27,7 @@ def test_tpg():
     gas.TPY = T,p,Y
 
     config = pg.files.config_file()
-    config['thermochem']['ctfile'] = ctfile
+    config['thermochem']['spdata'] = thfile
     config['thermochem']['eos'] = 'tpg'
     config['RHS']['diffusion'] = False
 
@@ -53,7 +54,6 @@ def test_tpg():
     pgcons = blk.array['Q'][1,1,1]
     pgprim = blk.array['q'][1,1,1]
     pgthrm = blk.array['qh'][1,1,1]
-
 
     def print_diff(name,c,p):
         diff = np.abs(c-p)/p*100
