@@ -22,13 +22,15 @@ np.seterr(all="raise")
 def simulate():
 
     config = pg.files.configFile()
-    config["RHS"]["diffusion"] = False
 
     mb = pg.multiBlock.generateMultiBlockSolver(1, config)
+    NE = 65
+    NN = 65
+    NX = 65
     pg.grid.create.multiBlockCube(
         mb,
         mbDims=[1, 1, 1],
-        dimsPerBlock=[65, 65, 65],
+        dimsPerBlock=[NE, NN, NX],
         lengths=[2 * np.pi for _ in range(3)],
     )
 
@@ -81,11 +83,11 @@ def simulate():
     e = []
     s = []
     t = []
-    tEnd = 120.0
-    while mb.tme * M0 < tEnd:
+    tEnd = 120.0 / M0
+    while mb.tme < tEnd:
 
         if mb.nrt % 50 == 0:
-            pg.misc.progressBar(mb.tme * M0, tEnd)
+            pg.misc.progressBar(mb.tme, tEnd)
 
             rke = np.sum(
                 0.5
