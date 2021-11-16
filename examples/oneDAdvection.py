@@ -45,11 +45,11 @@ def simulate():
     blk.getFace(2).orientation = "123"
     blk.getFace(2).commRank = 0
 
-    pg.mpiComm.blockComm.setBlockCommunication(mb)
+    mb.setBlockCommunication()
 
     mb.unifyGrid()
 
-    mb.computeMetrics()
+    mb.computeMetrics(config["RHS"]["diffOrder"])
 
     ng = blk.ng
     R = 281.4583333333333
