@@ -36,29 +36,39 @@ void mixedScaleModel(block_ b) {
 
   double dukdxk = dudx + dvdy + dwdz;
 
-  double A11 = 2.0*dudx - 2.0/3.0*dukdxk;
-  double A22 = 2.0*dvdy - 2.0/3.0*dukdxk;
-  double A33 = 2.0*dwdz - 2.0/3.0*dukdxk;
+  double S[3][3];
+  S[1][1] = 2.0*dudx - 2.0/3.0*dukdxk;
+  S[2][2] = 2.0*dvdy - 2.0/3.0*dukdxk;
+  S[3][3] = 2.0*dwdz - 2.0/3.0*dukdxk;
 
-  double A12 = dudy + dvdx;
-  double A13 = dudz + dwdx;
-  double A23 = dvdz + dwdy;
+  S[1][2] = dudy + dvdx;
+  S[2][1] = S[1][2];
+  S[1][3] = dudz + dwdx;
+  S[3][1] = S[3][1];
+  S[2][3] = dvdz + dwdy;
+  S[3][2] = S[2][3];
 
-  double invSij, usg, vsg, wsg;
+  double invSij=0.0;
+  double usg, vsg, wsg;
 
-  invSij = abs(A11*A22 + A22*A33 + A11*A33 - pow(A12,2.0) - pow(A13,2.0) - pow(A23,2.0));
+  for (int l; l < 3; l++) {
+    for (int m; m < 3; m++) {
+      invSij += S[l][m];
+    }
+  }
+  invSij = sqrt(0.5*fmax(invSij, 0.0));
 
-  usg = 1.0/3.0 * ( ( 0.25*b.q(i-1,j,k,1) + 0.5*u + 0.25*b.q(i+1,j,k,1) ) +
-                    ( 0.25*b.q(i,j-1,k,1) + 0.5*u + 0.25*b.q(i,j+1,k,1) ) +
-                    ( 0.25*b.q(i,j,k-1,1) + 0.5*u + 0.25*b.q(i,j,k+1,1) ) );
+  usg = 1.0/3.0 * ( 0.25*b.q(i-1,j,k,1) + 0.5*u + 0.25*b.q(i+1,j,k,1) +
+                    0.25*b.q(i,j-1,k,1) + 0.5*u + 0.25*b.q(i,j+1,k,1) +
+                    0.25*b.q(i,j,k-1,1) + 0.5*u + 0.25*b.q(i,j,k+1,1) );
 
-  vsg = 1.0/3.0 * ( ( 0.25*b.q(i-1,j,k,2) + 0.5*v + 0.25*b.q(i+1,j,k,2) ) +
-                    ( 0.25*b.q(i,j-1,k,2) + 0.5*v + 0.25*b.q(i,j+1,k,2) ) +
-                    ( 0.25*b.q(i,j,k-1,2) + 0.5*v + 0.25*b.q(i,j,k+1,2) ) );
+  vsg = 1.0/3.0 * ( 0.25*b.q(i-1,j,k,2) + 0.5*v + 0.25*b.q(i+1,j,k,2) +
+                    0.25*b.q(i,j-1,k,2) + 0.5*v + 0.25*b.q(i,j+1,k,2) +
+                    0.25*b.q(i,j,k-1,2) + 0.5*v + 0.25*b.q(i,j,k+1,2) );
 
-  wsg = 1.0/3.0 * ( ( 0.25*b.q(i-1,j,k,3) + 0.5*w + 0.25*b.q(i+1,j,k,3) ) +
-                    ( 0.25*b.q(i,j-1,k,3) + 0.5*w + 0.25*b.q(i,j+1,k,3) ) +
-                    ( 0.25*b.q(i,j,k-1,3) + 0.5*w + 0.25*b.q(i,j,k+1,3) ) );
+  wsg = 1.0/3.0 * ( 0.25*b.q(i-1,j,k,3) + 0.5*w + 0.25*b.q(i+1,j,k,3) +
+                    0.25*b.q(i,j-1,k,3) + 0.5*w + 0.25*b.q(i,j+1,k,3) +
+                    0.25*b.q(i,j,k-1,3) + 0.5*w + 0.25*b.q(i,j,k+1,3) );
 
   double qc2 = 0.5*(pow(u-usg,2.0) + pow(v-vsg,2.0) + pow(w-wsg,2.0));
 
@@ -77,4 +87,3 @@ void mixedScaleModel(block_ b) {
 
   });
 }
-
