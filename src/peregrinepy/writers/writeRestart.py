@@ -5,7 +5,13 @@ from .writerMetaData import restartMetaData
 
 
 def writeRestart(
-    mb, path="./", gridPath="./", animate=True, precision="double", lump=False
+    mb,
+    path="./",
+    gridPath="./",
+    animate=True,
+    precision="double",
+    withHalo=False,
+    lump=False,
 ):
     """This function produces an hdf5 file from a peregrinepy.multiBlock.restart for viewing in Paraview.
 
@@ -51,13 +57,18 @@ def writeRestart(
         nblki = blk.nblki
         ni, nj, nk = blk.ni, blk.nj, blk.nk
 
-        extentCC = (ni - 1) * (nj - 1) * (nk - 1)
-
         if blk.blockType == "solver":
-            ng = blk.ng
-            writeS = np.s_[ng:-ng, ng:-ng, ng:-ng]
+            if withHalo:
+                writeS = np.s_[:, :, :]
+                ng = blk.ng
+            else:
+                writeS = np.s_[blk.ng : -blk.ng, blk.ng : -blk.ng, blk.ng : -blk.ng]
+                ng = 0
         else:
             writeS = np.s_[:, :, :]
+            ng = 0
+
+        extentCC = (ni + 2 * ng - 1) * (nj + 2 * ng - 1) * (nk + 2 * ng - 1)
 
         # If not lumping the file, open it here
         if not lump:
@@ -84,10 +95,8 @@ def writeRestart(
             try:
                 dset[:] = blk.array["Q"][writeS + tuple([0])].ravel(order="F")
             except TypeError:
-                # Sometime we may not have density, so just make a zero array
-                dset[:] = np.zeros(blk.array["q"][:, :, :, 0][writeS].shape).ravel(
-                    order="F"
-                )
+                pass
+
         names = ["p", "u", "v", "w", "T"] + blk.speciesNames[0:-1]
         for j in range(len(names)):
             dsetName = names[j]
@@ -106,7 +115,7 @@ def writeRestart(
             dset[:] = 1.0
 
         # Add block to xdmf tree
-        blockElem = metaData.addBlockElem(nblki, ni, nj, nk, ng=0)
+        blockElem = metaData.addBlockElem(nblki, ni, nj, nk, ng)
 
         # Add scalar variables to block tree
         names = ["p", "T"] + blk.speciesNames
@@ -114,10 +123,12 @@ def writeRestart(
             names.insert(0, "rho")
 
         for name in names:
-            metaData.addScalarToBlockElem(blockElem, name, mb.nrt, nblki, ni, nj, nk)
+            metaData.addScalarToBlockElem(
+                blockElem, name, mb.nrt, nblki, ni, nj, nk, ng
+            )
         # Add vector variables to block tree
         metaData.addVectorToBlockElem(
-            blockElem, "Velocity", ["u", "v", "w"], mb.nrt, nblki, ni, nj, nk
+            blockElem, "Velocity", ["u", "v", "w"], mb.nrt, nblki, ni, nj, nk, ng
         )
 
         if mb.mbType == "restart":
