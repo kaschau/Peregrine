@@ -18,6 +18,7 @@ class rk4:
             AEQB(blk.Q0, blk.Q)
 
         # First Stage
+        self.titme = self.tme
         RHS(self)
 
         for blk in self:
@@ -26,6 +27,7 @@ class rk4:
         consistify(self)
 
         # Second Stage
+        self.titme = self.tme + dt / 2
         RHS(self)
 
         for blk in self:
@@ -34,6 +36,7 @@ class rk4:
         consistify(self)
 
         # Third Stage
+        self.titme = self.tme + dt / 2
         RHS(self)
 
         for blk in self:
@@ -42,6 +45,7 @@ class rk4:
         consistify(self)
 
         # Fourth Stage
+        self.titme = self.tme + dt
         RHS(self)
 
         for blk in self:
@@ -51,6 +55,7 @@ class rk4:
 
         self.nrt += 1
         self.tme += dt
+        self.titme = self.tme
 
     step.name = "rk4"
     step.stepType = "explicit"
