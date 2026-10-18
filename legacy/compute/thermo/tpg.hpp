@@ -1,0 +1,130 @@
+// A thermally perfect gas: every species' cp and h one polynomial in ln T.
+#ifndef __tpg_H__
+#define __tpg_H__
+
+#include "kernel.hpp"
+#include "species.hpp"
+
+namespace tpg {
+
+// the mixture state at one point, as the eos works it out
+struct state {
+  fpdtype p, T, rho, e, h, cp, gamma, c;
+};
+
+// what a cell keeps of the eos beyond p and T: gamma, cp, rho h, c, rho e;
+// a species enthalpy is one polynomial in T, so none are kept
+constexpr int qhComponents = 5;
+
+// the mixture gas constant from the mass fractions Y(n), n over every species
+template <class Yf> KOKKOS_INLINE_FUNCTION fpdtype gasConstant(const Yf &Y) {
+  fpdtype Rmix = 0.0;
+  for (int n = 0; n <= ns - 1; n++) {
+    Rmix += Y(n) * MWinv(n);
+  }
+  return Rmix * Ru;
+}
+
+// species n's enthalpy at T, u = ln T: h/(RT), Horner in u
+KOKKOS_INLINE_FUNCTION fpdtype enthalpy(const int n, const fpdtype T,
+                                        const fpdtype u, const fpdtype Tinv) {
+  fpdtype hRT = 0.0;
+  for (int m = hPolyTerms - 1; m >= 0; m--)
+    hRT = hRT * u + hPoly(n, m);
+  hRT += hRef(n) * Tinv;
+  return hRT * T * Ru * MWinv(n);
+}
+
+// each species' enthalpy at T, as a callable of the species; the cell's qh
+// is what a cubic eos reads its own from
+template <class Qh>
+KOKKOS_INLINE_FUNCTION auto enthalpies(const fpdtype T, const Qh &) {
+  const fpdtype u = log(T), Tinv = 1.0 / T;
+  return [=](const int n) { return enthalpy(n, T, u, Tinv); };
+}
+
+// the mixture enthalpy and cp at T
+template <class Yf>
+KOKKOS_INLINE_FUNCTION void properties(const fpdtype T, const Yf &Y, fpdtype &h,
+                                       fpdtype &cp) {
+  h = 0.0;
+  cp = 0.0;
+  const fpdtype u = log(T), Tinv = 1.0 / T;
+  for (int n = 0; n <= ns - 1; n++) {
+    // cp/R, Horner in u
+    fpdtype cpR = 0.0;
+    for (int m = cpPolyTerms - 1; m >= 0; m--)
+      cpR = cpR * u + cpPoly(n, m);
+    cp += cpR * Ru * MWinv(n) * Y(n);
+    h += enthalpy(n, T, u, Tinv) * Y(n);
+  }
+}
+
+// the state from pressure, temperature and mass fractions; hi(n, value)
+// receives each species' enthalpy an eos keeps in qh, which this one does not
+template <class Yf, class Hf>
+KOKKOS_INLINE_FUNCTION state fromPrims(const fpdtype p, const fpdtype T,
+                                       const Yf &Y, const Hf &) {
+  state s;
+  const fpdtype Rmix = gasConstant(Y);
+  properties(T, Y, s.h, s.cp);
+  s.p = p;
+  s.T = T;
+  s.gamma = s.cp / (s.cp - Rmix);
+  s.c = sqrt(s.gamma * Rmix * T);
+  s.rho = p / (Rmix * T);
+  s.e = s.h - Rmix * T;
+  return s;
+}
+
+// the state from density, internal energy and mass fractions: a fixed
+// count of Newton steps on T from the guess, the cell's last T. Measured
+// on GRI30: from within 1% the floor (1e-10 K, the fits' rounding) is
+// reached in 3, from 10% off in 3, from 50% off in 4. A fixed count keeps
+// every thread of a warp on the same path and cannot run away on a fit
+// whose floor sits above a tolerance; a step moves T by far less than 1%.
+constexpr int newtonSteps = 3;
+template <class Yf, class Hf>
+KOKKOS_INLINE_FUNCTION state fromCons(const fpdtype rho, const fpdtype e,
+                                      const Yf &Y, const fpdtype Tguess,
+                                      const Hf &) {
+  state s;
+  const fpdtype Rmix = gasConstant(Y);
+  fpdtype T = (Tguess < 1.0) ? 300.0 : Tguess;
+  for (int k = 0; k < newtonSteps; k++) {
+    properties(T, Y, s.h, s.cp);
+    T += (e - (s.h - Rmix * T)) / (s.cp - Rmix);
+  }
+  s.rho = rho;
+  s.e = e;
+  s.T = T;
+  s.p = rho * Rmix * T;
+  s.gamma = s.cp / (s.cp - Rmix);
+  s.c = sqrt(s.gamma * Rmix * T);
+  return s;
+}
+
+// the density's derivatives at (p, T, Y): by p, by T, and by each of the
+// first ns - 1 mass fractions with the last taking up the change; what the
+// dual time preconditioning linearizes with
+template <class Yf>
+KOKKOS_INLINE_FUNCTION void densityDerivatives(const fpdtype p, const fpdtype T,
+                                               const fpdtype rho, const Yf &Y,
+                                               fpdtype &rho_p, fpdtype &rho_T,
+                                               fpdtype *rho_Y) {
+  fpdtype denom = 0.0;
+  for (int n = 0; n <= ns - 1; n++) {
+    denom += Y(n) * MWinv(n);
+  }
+  // the mean molecular weight: Y sums to one, so sum(X MW) is 1 / sum(Y / MW)
+  const fpdtype MWmix = 1.0 / denom;
+  rho_p = rho / p;
+  rho_T = -rho / T;
+  for (int n = 0; n < ns - 1; n++) {
+    rho_Y[n] = -rho * MWmix * (MWinv(n) - MWinv(ns - 1));
+  }
+}
+
+} // namespace tpg
+
+#endif

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peregrine"
+description = "A multiblock, multiphysics CFD solver: Python over C++ kernels compiled per case"
+readme = "README.md"
+authors = [{name = "Kyle A. Schau", email = "kaschau89@gmail.com"}]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "numpy>=1.20",
+    "mpi4py>=3.0",
+    "h5py>=2.6",
+    "pyyaml>=6.0",
+    "lxml>=4.6",
+    "Mako>=1.2",
+]
+
+[project.optional-dependencies]
+tools = ["scipy>=1.8", "matplotlib", "pymetis>=2023.1"]
+test = ["pytest", "cantera", "CoolProp"]
+examples = ["matplotlib", "cantera"]
+
+[project.scripts]
+peregrine = "peregrine.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/kaschau/PEREGRINE"
+
+[tool.setuptools.packages.find]
+include = ["peregrine*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.mako", "*.hpp"]
+"peregrine.simulator.mixture" = ["database/*.yaml", "database/mechanisms/*.yaml"]
+"peregrine.simulator.sem" = ["database/*.yaml"]
+
+[tool.setuptools.dynamic]
+version = {attr = "peregrine._version.__version__"}
+
+[tool.pytest.ini_options]
+# a module that fails to import no longer hides the rest of its directory
+addopts = "--continue-on-collection-errors"

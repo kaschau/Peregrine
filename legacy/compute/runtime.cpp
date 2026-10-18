@@ -1,0 +1,413 @@
+#include "abi.hpp"
+#include <Kokkos_Core.hpp>
+#include <chrono>
+#include <memory>
+#include <vector>
+
+// The device graphs a run captures: a flow's launches, recorded once as a
+// chain of nodes in the order they were made and submitted as one from
+// then on. One capture is open at a time; the launch shapes read its tail.
+namespace {
+struct capturedGraph {
+  Kokkos::Experimental::Graph<execSpace> graph;
+  graphNode tail;
+  capturedGraph() : tail(graph.root_node()) {}
+};
+// leaked on purpose: a Kokkos object destroyed after finalize aborts, and
+// pgFinalize clears this first
+auto &graphs = *new std::vector<std::unique_ptr<capturedGraph>>;
+capturedGraph *capturing = nullptr;
+#ifdef PG_GRAPH_FORK
+// nodes added under the open capture: a sibling that added none has no end
+int launched = 0;
+#endif
+// host memory the device reaches at bus speed, what an exchange stages its
+// messages through: kept for the run, freed at finalize
+auto &pinned = *new std::vector<void *>;
+} // namespace
+
+// A second execution space instance for the copies an exchange stages
+// through the host, so they run beside the kernels instead of between
+// them: a copy out is ordered behind whatever the kernels' instance has
+// queued (the pack), the host waits on the copies alone, and a copy in
+// is waited on before the kernel that reads it is launched. On a host
+// build the instances are one and the copies synchronous.
+namespace {
+// made on first use and destroyed by pgFinalize: an instance outliving
+// finalize aborts at exit
+execSpace *copyInstance = nullptr;
+execSpace &copySpace() {
+  if (!copyInstance) {
+#if defined(KOKKOS_ENABLE_HIP)
+    hipStream_t stream;
+    KOKKOS_IMPL_HIP_SAFE_CALL(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    copyInstance = new execSpace(stream);
+#elif defined(KOKKOS_ENABLE_CUDA)
+    cudaStream_t stream;
+    KOKKOS_IMPL_CUDA_SAFE_CALL(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    copyInstance = new execSpace(stream);
+#else
+    copyInstance = new execSpace();
+#endif
+  }
+  return *copyInstance;
+}
+// an event one stream records and the other waits on, made once
+#if defined(KOKKOS_ENABLE_HIP)
+hipEvent_t streamEvent() {
+  static hipEvent_t event = [] {
+    hipEvent_t e;
+    KOKKOS_IMPL_HIP_SAFE_CALL(
+        hipEventCreateWithFlags(&e, hipEventDisableTiming));
+    return e;
+  }();
+  return event;
+}
+#elif defined(KOKKOS_ENABLE_CUDA)
+cudaEvent_t streamEvent() {
+  static cudaEvent_t event = [] {
+    cudaEvent_t e;
+    KOKKOS_IMPL_CUDA_SAFE_CALL(
+        cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    return e;
+  }();
+  return event;
+}
+#endif
+// the kernels' instance waits for what the copy instance has queued so far
+void kernelsAfterCopies() {
+#if defined(KOKKOS_ENABLE_HIP)
+  KOKKOS_IMPL_HIP_SAFE_CALL(
+      hipEventRecord(streamEvent(), copySpace().hip_stream()));
+  KOKKOS_IMPL_HIP_SAFE_CALL(
+      hipStreamWaitEvent(execSpace().hip_stream(), streamEvent(), 0));
+#elif defined(KOKKOS_ENABLE_CUDA)
+  KOKKOS_IMPL_CUDA_SAFE_CALL(
+      cudaEventRecord(streamEvent(), copySpace().cuda_stream()));
+  KOKKOS_IMPL_CUDA_SAFE_CALL(
+      cudaStreamWaitEvent(execSpace().cuda_stream(), streamEvent(), 0));
+#endif
+}
+// the copy instance waits for what the kernels' instance has queued so far
+void copyAfterKernels() {
+#if defined(KOKKOS_ENABLE_HIP)
+  static hipEvent_t event = [] {
+    hipEvent_t e;
+    KOKKOS_IMPL_HIP_SAFE_CALL(
+        hipEventCreateWithFlags(&e, hipEventDisableTiming));
+    return e;
+  }();
+  KOKKOS_IMPL_HIP_SAFE_CALL(hipEventRecord(event, execSpace().hip_stream()));
+  KOKKOS_IMPL_HIP_SAFE_CALL(
+      hipStreamWaitEvent(copySpace().hip_stream(), event, 0));
+#elif defined(KOKKOS_ENABLE_CUDA)
+  static cudaEvent_t event = [] {
+    cudaEvent_t e;
+    KOKKOS_IMPL_CUDA_SAFE_CALL(
+        cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    return e;
+  }();
+  KOKKOS_IMPL_CUDA_SAFE_CALL(cudaEventRecord(event, execSpace().cuda_stream()));
+  KOKKOS_IMPL_CUDA_SAFE_CALL(
+      cudaStreamWaitEvent(copySpace().cuda_stream(), event, 0));
+#endif
+}
+
+// Stamps on the kernels' instance, timed: what the exchange measures its
+// device idle with, the time the kernels' stream spends between the last
+// kernel that did not need a halo and the first that does. On a device a
+// stamp is a timing event recorded on the stream, read once the later one
+// has passed; on the host, where the kernels run in the calling thread,
+// it is the clock.
+constexpr int stampSlots = 256;
+#if defined(KOKKOS_ENABLE_HIP)
+hipEvent_t stampEvent(int slot) {
+  static hipEvent_t events[stampSlots] = {};
+  if (!events[slot])
+    KOKKOS_IMPL_HIP_SAFE_CALL(hipEventCreate(&events[slot]));
+  return events[slot];
+}
+#elif defined(KOKKOS_ENABLE_CUDA)
+cudaEvent_t stampEvent(int slot) {
+  static cudaEvent_t events[stampSlots] = {};
+  if (!events[slot])
+    KOKKOS_IMPL_CUDA_SAFE_CALL(cudaEventCreate(&events[slot]));
+  return events[slot];
+}
+#else
+std::chrono::steady_clock::time_point stamps[stampSlots];
+#endif
+} // namespace
+
+// The runtime half of the ABI: memory where the kernels run, and the copies
+// in and out of it.
+
+// records stamp :slot: where the kernels' instance now is
+PG_ABI void pgStampKernels(int slot) {
+#if defined(KOKKOS_ENABLE_HIP)
+  KOKKOS_IMPL_HIP_SAFE_CALL(
+      hipEventRecord(stampEvent(slot), execSpace().hip_stream()));
+#elif defined(KOKKOS_ENABLE_CUDA)
+  KOKKOS_IMPL_CUDA_SAFE_CALL(
+      cudaEventRecord(stampEvent(slot), execSpace().cuda_stream()));
+#else
+  stamps[slot] = std::chrono::steady_clock::now();
+#endif
+}
+
+// the milliseconds the kernels' instance took from stamp :a: to stamp :b:,
+// waiting for :b: to have passed; called well after, so the wait is none
+PG_ABI double pgStampElapsed(int a, int b) {
+#if defined(KOKKOS_ENABLE_HIP)
+  float ms = 0.0f;
+  KOKKOS_IMPL_HIP_SAFE_CALL(hipEventSynchronize(stampEvent(b)));
+  KOKKOS_IMPL_HIP_SAFE_CALL(hipEventElapsedTime(&ms, stampEvent(a), stampEvent(b)));
+  return ms;
+#elif defined(KOKKOS_ENABLE_CUDA)
+  float ms = 0.0f;
+  KOKKOS_IMPL_CUDA_SAFE_CALL(cudaEventSynchronize(stampEvent(b)));
+  KOKKOS_IMPL_CUDA_SAFE_CALL(
+      cudaEventElapsedTime(&ms, stampEvent(a), stampEvent(b)));
+  return ms;
+#else
+  return std::chrono::duration<double, std::milli>(stamps[b] - stamps[a]).count();
+#endif
+}
+
+// how many devices this process may use; one, the host, without a device
+namespace {
+int visibleDevices() {
+  int count = 1;
+#if defined(KOKKOS_ENABLE_HIP)
+  hipGetDeviceCount(&count);
+#elif defined(KOKKOS_ENABLE_CUDA)
+  cudaGetDeviceCount(&count);
+#endif
+  return count > 0 ? count : 1;
+}
+} // namespace
+
+// starts Kokkos on the device this rank takes: the ranks sharing a node
+// take its devices in turn by their local rank, so a launcher need not
+// bind them
+PG_ABI void pgInitialize(int localRank) {
+  if (Kokkos::is_initialized())
+    return;
+  Kokkos::InitializationSettings settings;
+  settings.set_device_id(localRank % visibleDevices());
+  Kokkos::initialize(settings);
+}
+
+PG_ABI void pgFinalize() {
+  graphs.clear();
+  capturing = nullptr;
+  delete copyInstance;
+  copyInstance = nullptr;
+  for (void *host : pinned)
+    Kokkos::kokkos_free<Kokkos::SharedHostPinnedSpace>(host);
+  pinned.clear();
+  if (Kokkos::is_initialized())
+    Kokkos::finalize();
+}
+
+// 1 if arrays are LayoutLeft on this device, so the host side allocates to
+// match
+PG_ABI int pgLayoutLeft() {
+  return std::is_same<layout, Kokkos::LayoutLeft>::value;
+}
+
+// the execution space the runtime was built for, as Kokkos names it:
+// Serial, OpenMP, Cuda, HIP
+PG_ABI const char *pgBackend() { return execSpace::name(); }
+
+// 1 if the kernels' memory is host memory, so python can hand a kernel its
+// own numpy buffers. Not SpaceAccessibility: a managed-memory build is
+// accessible from the host, but numpy's allocations are not managed.
+PG_ABI int pgOnHost() { return std::is_same_v<viewSpace, Kokkos::HostSpace>; }
+
+// zeroed, as a Kokkos::View would be: the kernels accumulate into fresh arrays
+PG_ABI void *pgAllocate(size_t bytes) {
+  void *device = Kokkos::kokkos_malloc<viewSpace>("pg", bytes);
+  using deviceBytes =
+      Kokkos::View<char *, viewSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  Kokkos::deep_copy(deviceBytes(static_cast<char *>(device), bytes), 0);
+  return device;
+}
+
+// opens a capture: every launch until pgGraphEnd becomes a node; the id
+// submits it later
+PG_ABI int pgGraphBegin() {
+  graphs.push_back(std::make_unique<capturedGraph>());
+  capturing = graphs.back().get();
+  return static_cast<int>(graphs.size()) - 1;
+}
+
+PG_ABI void pgGraphEnd() {
+  capturing->graph.instantiate();
+  capturing = nullptr;
+}
+
+// the graph runs in order on the execution space, after what was queued
+// before it, like the launches it stands for
+PG_ABI void pgGraphSubmit(int id) { graphs[id]->graph.submit(execSpace{}); }
+
+// a graph whose arrays or faces changed is dropped; a new capture replaces it
+PG_ABI void pgGraphDrop(int id) { graphs[id].reset(); }
+
+PG_ABI bool pgGraphCapturing() { return capturing != nullptr; }
+
+// the tail a launch shape chains its node onto; asking for it is adding one
+PG_ABI graphNode *pgGraphTail() {
+  if (!capturing)
+    return nullptr;
+#ifdef PG_GRAPH_FORK
+  ++launched;
+#endif
+  return &capturing->tail;
+}
+
+// Independent launches: a fork's siblings read and write nothing of each
+// other's, so a graph could fan them out from the fork and join them with
+// when_all. Kokkos 5.2.1's HIP when_all hangs the device on the next fence
+// (measured 2026-09-18, MI100), and the graphs round found no gain in
+// graph-level overlap, so by default the siblings are launches in order,
+// under capture or not, and these three say only that they need not be.
+// PG_GRAPH_FORK builds the fan-out, for measuring it where when_all works.
+#ifdef PG_GRAPH_FORK
+namespace {
+// an open fork: the node its siblings hang off, the end of each sibling
+// closed so far that launched anything, and the node count when the open
+// one began, or -1 with none open
+struct openFork {
+  graphNode base;
+  std::vector<graphNode> ends;
+  int began = -1;
+};
+auto &forks = *new std::vector<openFork>;
+void closeSibling(openFork &fork) {
+  if (fork.began >= 0 && launched > fork.began)
+    fork.ends.push_back(capturing->tail);
+}
+} // namespace
+PG_ABI void pgGraphFork() {
+  if (capturing)
+    forks.push_back({capturing->tail, {}});
+}
+PG_ABI void pgGraphSibling() {
+  if (!capturing)
+    return;
+  openFork &fork = forks.back();
+  closeSibling(fork);
+  capturing->tail = fork.base;
+  fork.began = launched;
+}
+PG_ABI void pgGraphJoin() {
+  if (!capturing)
+    return;
+  openFork &fork = forks.back();
+  closeSibling(fork);
+  graphNode joined = fork.ends.empty() ? fork.base : fork.ends[0];
+  for (size_t i = 1; i < fork.ends.size(); ++i)
+    joined = Kokkos::Experimental::when_all(joined, fork.ends[i]);
+  capturing->tail = joined;
+  forks.pop_back();
+}
+#else
+PG_ABI void pgGraphFork() {}
+PG_ABI void pgGraphSibling() {}
+PG_ABI void pgGraphJoin() {}
+#endif
+
+// an array outliving finalize is the process exiting; there is nothing to free
+PG_ABI void pgFree(void *device) {
+  if (Kokkos::is_initialized())
+    Kokkos::kokkos_free<viewSpace>(device);
+}
+
+PG_ABI void pgCopyToHostAside(const void *device, void *host, size_t bytes) {
+  using deviceBytes = Kokkos::View<const char *, viewSpace,
+                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using hostBytes =
+      Kokkos::View<char *, hostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  copyAfterKernels();
+  Kokkos::deep_copy(copySpace(), hostBytes(static_cast<char *>(host), bytes),
+                    deviceBytes(static_cast<const char *>(device), bytes));
+}
+PG_ABI void pgCopyToDeviceAside(const void *host, void *device, size_t bytes) {
+  using hostBytes = Kokkos::View<const char *, hostSpace,
+                                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using deviceBytes =
+      Kokkos::View<char *, viewSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  Kokkos::deep_copy(copySpace(),
+                    deviceBytes(static_cast<char *>(device), bytes),
+                    hostBytes(static_cast<const char *>(host), bytes));
+}
+// the host waits for the copies alone
+PG_ABI void pgCopyWait() { copySpace().fence(); }
+// marks what the kernels have queued so far as what pgCopyWait waits for:
+// a message sent straight from a device pool waits on its pack this way,
+// beside whatever kernels are queued after it
+PG_ABI void pgMarkKernels() { copyAfterKernels(); }
+// the kernels launched from here on wait for the copies queued so far, where
+// they run: a landed message copied in beside the kernels is read by the
+// unpack without the host waiting for the copy
+PG_ABI void pgKernelsAfterCopies() { kernelsAfterCopies(); }
+
+// whether an address is device memory to the device's driver; on a host
+// build nothing is
+PG_ABI int pgOnDevice(const void *p) {
+#if defined(KOKKOS_ENABLE_CUDA)
+  cudaPointerAttributes a;
+  if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  return a.type == cudaMemoryTypeDevice;
+#elif defined(KOKKOS_ENABLE_HIP)
+  hipPointerAttribute_t a;
+  if (hipPointerGetAttributes(&a, p) != hipSuccess) {
+    (void)hipGetLastError();
+    return 0;
+  }
+  return a.type == hipMemoryTypeDevice;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+// pinned host memory, on a host build host memory like any other
+PG_ABI void *pgAllocatePinned(size_t bytes) {
+  pinned.push_back(
+      Kokkos::kokkos_malloc<Kokkos::SharedHostPinnedSpace>("pgPinned", bytes));
+  return pinned.back();
+}
+
+// A copy is queued on the execution space like a kernel, so a device-side
+// consumer follows it in order; only a host-side reader has to wait.
+PG_ABI void pgToHost(const void *device, void *host, size_t bytes, int wait) {
+  using deviceBytes = Kokkos::View<const char *, viewSpace,
+                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using hostBytes =
+      Kokkos::View<char *, hostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  Kokkos::deep_copy(execSpace(), hostBytes(static_cast<char *>(host), bytes),
+                    deviceBytes(static_cast<const char *>(device), bytes));
+  if (wait)
+    Kokkos::fence();
+}
+
+PG_ABI void pgToDevice(const void *host, void *device, size_t bytes, int wait) {
+  using hostBytes = Kokkos::View<const char *, hostSpace,
+                                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using deviceBytes =
+      Kokkos::View<char *, viewSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  Kokkos::deep_copy(execSpace(),
+                    deviceBytes(static_cast<char *>(device), bytes),
+                    hostBytes(static_cast<const char *>(host), bytes));
+  if (wait)
+    Kokkos::fence();
+}
+
+PG_ABI void pgFence() { Kokkos::fence(); }

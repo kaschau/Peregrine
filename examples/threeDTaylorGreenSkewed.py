@@ -15,83 +15,86 @@ https://doi.org/10.1016/j.jcp.2021.110482.
 
 Will reproduce test case from section 6.2
 
+    python examples/threeDTaylorGreenSkewed.py <backend>
+
 """
 
 from mpi4py import MPI  # noqa: F401
 
-import peregrinepy as pg
+import sys
+
+import peregrine as pg
 import numpy as np
 import matplotlib.pyplot as plt
+
+# the ideal gas the case assumes, stated in full
+air = {"Air": {"MW": 28.97, "cp0": 1000.0}}
+
 
 np.seterr(all="raise")
 
 
-def simulate():
-    config = pg.files.configFile()
-    config.validateConfig()
+class SkewedCube(pg.mesher.CubeMesher):
+    """A periodic cube whose nodes are moved off their lines by a product
+    of sines, so no cell is a box."""
 
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
+    def shape_blk(self, blk, i, j, k):
+        super().shape_blk(blk, i, j, k)
+        NE, NN, NX = self.blkdims
+        xMin = yMin = zMin = -np.pi
+        Lx = Ly = Lz = 2 * np.pi
+        lamXY = lamYZ = lamXZ = 8.0
+        kappa = 0.25
+        Ax = Ay = Az = 1.0
+        delX, delY, delZ = Lx / (NE - 1), Ly / (NN - 1), Lz / (NX - 1)
+        E, N, X = np.meshgrid(
+            np.arange(NE), np.arange(NN), np.arange(NX), indexing="ij"
+        )
+        skew = np.sin(2 * np.pi * kappa)
+        nodes = blk.nodes.get()
+        skewed = nodes[blk.interior]
+        skewed[..., 0] = xMin + delX * (
+            E
+            + Ax
+            * skew
+            * np.sin(lamXY * np.pi * N * delY / Ly)
+            * np.sin(lamXZ * np.pi * X * delZ / Lz)
+        )
+        skewed[..., 1] = yMin + delY * (
+            N
+            + Ay
+            * skew
+            * np.sin(lamXY * np.pi * E * delX / Lx)
+            * np.sin(lamYZ * np.pi * X * delZ / Lz)
+        )
+        skewed[..., 2] = zMin + delZ * (
+            X
+            + Az
+            * skew
+            * np.sin(lamXZ * np.pi * E * delX / Lx)
+            * np.sin(lamYZ * np.pi * N * delY / Ly)
+        )
+        blk.nodes.set(nodes)
+
+
+def simulate(name):
+    config = pg.Config()
+    config["simulation"]["simulator"] = "euler"
+    config["mixture"]["species"] = air
+    config.validate()
+    backend = pg.get_backend(name, config)
+
     NE = 64
     NN = 64
     NX = 64
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=[NE, NN, NX],
+    mesh = SkewedCube(
+        mbdims=[1, 1, 1],
+        blkdims=[NE, NN, NX],
         lengths=[2 * np.pi for _ in range(3)],
         periodic=[True, True, True],
     )
-
-    mb.initSolverArrays(config)
-
-    blk = mb[0]
-    ng = blk.ng
-
-    # SKEW THE GRID
-    xMin = yMin = zMin = -np.pi
-    Lx = Ly = Lz = 2 * np.pi
-    lamXY = lamYZ = lamXZ = 8.0
-    kappa = 0.25
-    Ax = Ay = Az = 1.0
-    delX = Lx / (NE - 1)
-    delY = Ly / (NN - 1)
-    delZ = Lz / (NX - 1)
-
-    x = blk.array["x"]
-    y = blk.array["y"]
-    z = blk.array["z"]
-    for E in range(NE):
-        for N in range(NN):
-            for X in range(NX):
-                x[E + ng, N + ng, X + ng] = xMin + delX * (
-                    E
-                    + Ax
-                    * np.sin(2 * np.pi * kappa)
-                    * np.sin(lamXY * np.pi * N * delY / Ly)
-                    * np.sin(lamXZ * np.pi * X * delZ / Lz)
-                )
-                y[E + ng, N + ng, X + ng] = yMin + delY * (
-                    N
-                    + Ay
-                    * np.sin(2 * np.pi * kappa)
-                    * np.sin(lamXY * np.pi * E * delX / Lx)
-                    * np.sin(lamYZ * np.pi * X * delZ / Lz)
-                )
-                z[E + ng, N + ng, X + ng] = zMin + delZ * (
-                    X
-                    + Az
-                    * np.sin(2 * np.pi * kappa)
-                    * np.sin(lamXZ * np.pi * E * delX / Lx)
-                    * np.sin(lamYZ * np.pi * N * delY / Ly)
-                )
-
-    for face in blk.faces:
-        face.commRank = 0
-
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-    mb.computeMetrics()
+    mb = pg.get_solver(config, mesh, backend)
+    blk = mb.blocks[0]
 
     R = 287.002507
     cp = 1000.0
@@ -99,55 +102,36 @@ def simulate():
     rho0 = 1.0
     gamma = cp / (cp - R)
 
-    xc = blk.array["xc"]
-    yc = blk.array["yc"]
-    zc = blk.array["zc"]
-
-    blk.array["q"][:, :, :, 0] = 1 / gamma + (rho0 * M0**2 / 16.0) * (
+    xc, yc, zc = (blk.xcc.get()[..., n] for n in range(3))
+    # the primitive vector, p, u, v, w, T
+    q = np.zeros(blk.Q.shape[:3] + (mb.sim.ne,))
+    q[:, :, :, 0] = 1 / gamma + (rho0 * M0**2 / 16.0) * (
         np.cos(2 * xc) + np.cos(2 * yc)
     ) * (np.cos(2 * zc) + 2.0)
-    blk.array["q"][:, :, :, 1] = M0 * np.sin(xc) * np.cos(yc) * np.cos(zc)
-    blk.array["q"][:, :, :, 2] = -M0 * np.cos(xc) * np.sin(yc) * np.cos(zc)
-    blk.array["q"][:, :, :, 3] = 0.0
-    blk.array["q"][:, :, :, 4] = blk.array["q"][:, :, :, 0] / (R * rho0)
-
-    blk.updateDeviceView("q")
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
+    q[:, :, :, 1] = M0 * np.sin(xc) * np.cos(yc) * np.cos(zc)
+    q[:, :, :, 2] = -M0 * np.cos(xc) * np.sin(yc) * np.cos(zc)
+    q[:, :, :, 4] = q[:, :, :, 0] / (R * rho0)
+    mb.set_prims([q])
 
     dt = 0.1 * 2 * np.pi / NE
     ke = []
     s = []
     t = []
-    tEnd = 120 / M0
-    while mb.tme < tEnd:
+    tend = 120 / M0
+    bar = pg.misc.Progress(tend)
+    while mb.tme.get() < tend:
         if mb.nrt % 50 == 0:
-            pg.misc.progressBar(mb.tme, tEnd)
-            blk.updateHostView(["q", "Q"])
+            bar.at(mb.tme.get())
+            data = mb.sim.iovars.data(blk, ["rho", "p", "u", "v", "w"])
+            rho, p, u, v, w = (data[n][blk.interior] for n in "rho p u v w".split())
+            J = 1.0 / blk.detJinv.get()[blk.interior]
 
-            rke = np.sum(
-                0.5
-                * blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                * (
-                    blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 1] ** 2
-                    + blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 2] ** 2
-                    + blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 3] ** 2
-                )
-                * blk.array["J"][ng:-ng, ng:-ng, ng:-ng]
-            )
-
-            rS = np.sum(
-                blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                * np.log10(
-                    blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                    * blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0] ** (-gamma)
-                )
-                * blk.array["J"][ng:-ng, ng:-ng, ng:-ng]
-            )
+            rke = np.sum(0.5 * rho * (u**2 + v**2 + w**2) * J)
+            rS = np.sum(rho * np.log10(p * rho ** (-gamma)) * J)
 
             ke.append(rke)
             s.append(rS)
-            t.append(mb.tme * M0)
+            t.append(mb.tme.get() * M0)
 
         mb.step(dt)
 
@@ -161,16 +145,14 @@ def simulate():
     plt.title(r"$\Delta(\rho s) / (\rho_0 s_0)$")
     plt.savefig("entropy.png")
     plt.clf()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

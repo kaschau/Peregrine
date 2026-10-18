@@ -8,68 +8,71 @@ https://doi.org/10.1016/j.jcp.2021.110482
 
 Should reproduce figure 3 depending on resolution setting.
 
+    python examples/twoDEulerVortex.py <backend>
 
 """
 
 from mpi4py import MPI  # noqa: F401
-import peregrinepy as pg
+import sys
+import peregrine as pg
 import numpy as np
 from time import perf_counter
 import matplotlib.pyplot as plt
 
+# the ideal gas the case assumes, stated in full
+air = {"Air": {"MW": 28.97, "cp0": 1000.0}}
+
+
 np.seterr(all="raise")
 
 
-def simulate():
-    config = pg.files.configFile()
-    config.validateConfig()
+class SkewedSheet(pg.mesher.CubeMesher):
+    """A sheet periodic in x and y whose nodes are moved off their lines by
+    a product of sines, so no cell is a box."""
 
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
+    def shape_blk(self, blk, i, j, k):
+        super().shape_blk(blk, i, j, k)
+        NE, NN, _ = self.blkdims
+        Lx = Ly = 12.0
+        delX, delY = Lx / (NE - 1), Ly / (NN - 1)
+        Ax = Ay = 1.0
+        xMin = yMin = -6.0
+        lamX = lamY = 4.0
+        kappa = 0.25
+        E, N = np.meshgrid(np.arange(NE), np.arange(NN), indexing="ij")
+        skew = np.sin(2 * np.pi * kappa)
+        nodes = blk.nodes.get()
+        skewed = nodes[blk.interior]
+        skewed[..., 0] = (
+            xMin + delX * (E + Ax * skew * np.sin(lamX * np.pi * N * delY / Ly))
+        )[..., None]
+        skewed[..., 1] = (
+            yMin + delY * (N + Ay * skew * np.sin(lamY * np.pi * E * delX / Lx))
+        )[..., None]
+        blk.nodes.set(nodes)
+
+
+def simulate(name):
+    config = pg.Config()
+    config["simulation"]["simulator"] = "euler"
+    config["mixture"]["species"] = air
+    config["bcvals"]["sides"] = {"kind": "slp-adia-wall"}
+    config.validate()
+    backend = pg.get_backend(name, config)
+
     NE = NN = 41
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=[NE, NN, 2],
+    Lx = 12.0
+    mesh = SkewedSheet(
+        mbdims=[1, 1, 1],
+        blkdims=[NE, NN, 2],
         lengths=[12, 12, 0.01],
         periodic=[True, True, False],
+        bcnames={5: "sides", 6: "sides"},
     )
-
-    blk = mb[0]
+    mb = pg.get_solver(config, mesh, backend)
+    blk = mb.blocks[0]
     ng = blk.ng
-
-    # SKEW THE GRID
     x0 = y0 = 0.0
-    Lx = Ly = 12.0
-    delX = Lx / (NE - 1)
-    delY = Ly / (NN - 1)
-    Ax = Ay = 1.0
-    xMin = yMin = -6.0
-    lamX = lamY = 4.0
-    kappa = 0.25
-    x = blk.array["x"]
-    y = blk.array["y"]
-    for E in range(NE):
-        for N in range(NN):
-            x[E + ng, N + ng, :] = xMin + delX * (
-                E
-                + Ax * np.sin(2 * np.pi * kappa) * np.sin(lamX * np.pi * N * delY / Ly)
-            )
-            y[E + ng, N + ng, :] = yMin + delY * (
-                N
-                + Ay * np.sin(2 * np.pi * kappa) * np.sin(lamY * np.pi * E * delX / Lx)
-            )
-
-    for face in blk.faces[0:4]:
-        face.commRank = 0
-    for f in [5, 6]:
-        face = blk.getFace(f)
-        face.bcType = "adiabaticSlipWall"
-
-    mb.initSolverArrays(config)
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-    mb.computeMetrics()
     print(mb)
 
     Rc = 1.0
@@ -85,45 +88,41 @@ def simulate():
     uInf = MInf * aInf
     C0 = 0.02 * uInf * Rc
 
-    xc = blk.array["xc"]
-    yc = blk.array["yc"]
+    xc, yc = (blk.xcc.get()[..., n] for n in range(2))
 
     r = np.sqrt(((xc - x0) ** 2 + (yc - y0) ** 2) / Rc**2)
 
+    # the primitive vector, p, u, v, w, T
+    q = np.zeros(blk.Q.shape[:3] + (mb.sim.ne,))
     # u
-    blk.array["q"][:, :, :, 1] = uInf - (C0 * (yc - y0) / Rc**2) * np.exp(-(r**2) / 2.0)
+    q[:, :, :, 1] = uInf - (C0 * (yc - y0) / Rc**2) * np.exp(-(r**2) / 2.0)
     # v
-    blk.array["q"][:, :, :, 2] = (C0 * (xc - x0) / Rc**2) * np.exp(-(r**2) / 2.0)
+    q[:, :, :, 2] = (C0 * (xc - x0) / Rc**2) * np.exp(-(r**2) / 2.0)
 
     # p
-    blk.array["q"][:, :, :, 0] = pInf - rhoInf * C0**2 / (2.0 * Rc**2) * np.exp(
-        -(r**2) / 2.0
-    )
+    q[:, :, :, 0] = pInf - rhoInf * C0**2 / (2.0 * Rc**2) * np.exp(-(r**2) / 2.0)
     # T
-    blk.array["q"][:, :, :, 4] = blk.array["q"][:, :, :, 0] / (R * rhoInf)
+    q[:, :, :, 4] = q[:, :, :, 0] / (R * rhoInf)
 
-    blk.updateDeviceView(["q"])
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
+    mb.set_prims([q])
 
     refX = xc[ng:-ng, int(NN / 2.0), ng] / Rc
-    refV = np.copy(blk.array["q"][ng:-ng, int(NN / 2.0), ng, 2] / uInf)
+    refV = np.copy(q[ng:-ng, int(NN / 2.0), ng, 2] / uInf)
 
     dt = 0.1 * (Lx / NE) / aInf
-    tEnd = Lx / uInf
+    tend = Lx / uInf
 
     ts = perf_counter()
-    while mb.tme < tEnd:
+    bar = pg.misc.Progress(tend)
+    while mb.tme.get() < tend:
         if mb.nrt % 50 == 0:
-            pg.misc.progressBar(mb.tme, tEnd)
+            bar.at(mb.tme.get())
         mb.step(dt)
     print(f"Time integration took {perf_counter()-ts} seconds.")
 
-    blk.updateHostView(["q"])
+    v = mb.sim.iovars.data(blk, ["v"])["v"]
     # plot v/Uinf
-    plt.plot(
-        refX, blk.array["q"][ng:-ng, int(NN / 2.0), ng, 2] / uInf, label=f"{NE = }"
-    )
+    plt.plot(refX, v[ng:-ng, int(NN / 2.0), ng] / uInf, label=f"{NE = }")
     plt.plot(refX, refV, "o", label="exact")
     plt.ylim([-0.016, 0.016])
     plt.xlim([-6, 6])
@@ -131,16 +130,14 @@ def simulate():
     plt.legend()
     plt.show()
     plt.clf()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

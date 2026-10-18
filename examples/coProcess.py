@@ -3,12 +3,15 @@
 
 run with 2 mpi processes!!!!!!
 
+    mpiexec -n 2 python examples/coProcess.py <backend>
+
 """
 
 from mpi4py import MPI  # noqa: F401
 
-import peregrinepy as pg
-import numpy as np
+import sys
+
+import peregrine as pg
 import os
 
 fname = """
@@ -68,6 +71,8 @@ SetActiveSource(vTM1)
 # Catalyst options
 from paraview import catalyst
 
+
+
 options = catalyst.Options()
 options.ExtractsOutputDirectory = "./"
 options.GlobalTrigger = "TimeStep"
@@ -85,113 +90,93 @@ if __name__ == "__main__":
     SaveExtractsUsingCatalystOptions(options)
 """
 
+# a calorically perfect air, stated in full: the library carries no such species
+air = {
+    "Air": {
+        "MW": 28.97,
+        "cp0": 1002.838449439523,
+        "mu0": 1.8591191080521142e-05,
+        "kappa0": 0.02625394405190068,
+    }
+}
 
-def simulate():
-    config = pg.files.configFile()
-    config["RHS"]["diffusion"] = True
-    config["thermochem"]["spdata"] = ["Air"]
-    config["thermochem"]["trans"] = "constantProps"
-    config["coprocess"]["catalyst"] = True
-    config["coprocess"]["catalystFile"] = "tempcoproc.py"
-    config.validateConfig()
 
-    comm, rank, size = pg.mpiComm.mpiUtils.getCommRankSize()
+class RankMesher(pg.mesher.CubeMesher):
+    """A row of blocks along i, one per rank: each rank meshes the block of
+    its number and joins it to its neighbors across the ranks."""
+
+    def fill(self, mb):
+        rank = pg.misc.get_comm_rank_size()[1]
+        blk = mb.add_blk(rank)
+        mb.nblocks = self.nblks
+        self.shape_blk(blk, rank, 0, 0)
+        self.connect(blk, rank, (rank, 0, 0))
+        for face in blk.intfaces:
+            face.nbrrank = face.nbr
+        self.set_periodics(blk, rank, 0, 0)
+
+
+def simulate(name):
+    """A channel of two blocks, fed at one end and let out the other, with
+    Catalyst watching every step."""
+    config = pg.Config()
+    config["simulation"]["simulator"] = "navier-stokes"
+    config["mixture"]["species"] = air
+    config["mixture"]["trans"] = "constant"
+    config["plugins"]["catalyst"] = {"script": "tempcoproc.py"}
+    config["ics"]["u"] = 10.0
+    config["bcvals"]["inlet"] = {
+        "kind": "sub-in-fvt",
+        "u": 10.0,
+        "v": 0.0,
+        "w": 0.0,
+        "T": 300.0,
+    }
+    config["bcvals"]["exit"] = {
+        "kind": "sub-out-fp",
+        "p": 101325.0,
+    }
+    config["bcvals"]["walls"] = {"kind": "no-slp-adia-wall"}
+    config.validate()
+    backend = pg.get_backend(name, config)
+
+    comm, rank, size = pg.misc.get_comm_rank_size()
     if rank == 0:
         with open("tempcoproc.py", "w") as f:
             f.write(fname)
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
-    blk = mb[0]
-    if rank == 0:
-        pg.grid.create.multiBlockCube(
-            mb, mbDims=[1, 1, 1], dimsPerBlock=[100, 40, 2], lengths=[0.1, 0.02, 0.001]
-        )
-        mb.totalBlocks = 2
-        face = blk.getFace(1)
-        face.bcType = "constantVelocitySubsonicInlet"
-        inputBcValues = {}
-        inputBcValues["p"] = 101325.0
-        inputBcValues["u"] = 10.0
-        inputBcValues["v"] = 0.0
-        inputBcValues["w"] = 0.0
-        inputBcValues["T"] = 300.0
-
-        face.array["qBcVals"] = np.zeros((blk.array["q"][face.s1_].shape))
-        pg.bcs.prepInlets.prep_constantVelocitySubsonicInlet(blk, face, inputBcValues)
-        shape = blk.array["q"][face.s1_].shape
-        pg.misc.createViewMirrorArray(face, "qBcVals", shape)
-
-        face = blk.getFace(2)
-        face.commRank = 1
-        face.neighbor = 1
-        face.bcType = "b0"
-        face.orientation = "123"
-
-    else:
-        pg.grid.create.multiBlockCube(
-            mb,
-            origin=[0.1, 0.0, 0.0],
-            mbDims=[1, 1, 1],
-            dimsPerBlock=[100, 40, 2],
-            lengths=[0.1, 0.02, 0.001],
-        )
-        mb.totalBlocks = 2
-        blk.nblki = 1
-        face = blk.getFace(2)
-        face.bcType = "constantPressureSubsonicExit"
-        inputBcValues = {}
-        inputBcValues["p"] = 101325.0
-        face.array["qBcVals"] = np.zeros((blk.array["q"][face.s1_].shape))
-        pg.bcs.prepExits.prep_constantPressureSubsonicExit(blk, face, inputBcValues)
-        shape = blk.array["q"][face.s1_].shape
-        pg.misc.createViewMirrorArray(face, "qBcVals", shape)
-
-        face = blk.getFace(1)
-        face.commRank = 0
-        face.neighbor = 0
-        face.bcType = "b0"
-        face.orientation = "123"
-
-    for f in [3, 4]:
-        face = blk.getFace(f)
-        face.bcType = "adiabaticNoSlipWall"
-
-    mb.setBlockCommunication()
-
-    mb.initSolverArrays(config)
-    mb.generateHalo()
-    mb.computeMetrics()
-
-    blk.array["q"][:, :, :, 0] = 101325.0
-    blk.array["q"][:, :, :, 1] = 10.0
-    blk.array["q"][:, :, :, 4] = 300.0
-
-    blk.updateDeviceView("q")
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
-    mb.coproc = pg.coproc.coprocessor(mb)
+    # the plugin reads the pipeline on every rank
+    comm.Barrier()
+    mesh = RankMesher(
+        mbdims=[2, 1, 1],
+        blkdims=[100, 40, 2],
+        lengths=[0.2, 0.02, 0.001],
+        periodic=[False, False, True],
+        bcnames={1: "inlet", 2: "exit", 3: "walls", 4: "walls"},
+    )
+    mb = pg.get_solver(config, mesh, backend)
 
     if rank == 0:
         print(mb)
     dt = 1.44e-6
-    mb.coproc(mb)
+    catalyst = mb.plugins["catalyst"]
+    catalyst(mb)
+    bar = pg.misc.Progress(100, quiet=rank != 0)
     while mb.nrt < 100:
-        pg.misc.progressBar(mb.nrt, 100)
+        bar.at(mb.nrt)
         mb.step(dt)
-        mb.coproc(mb)
+        catalyst(mb)
 
-    mb.coproc.finalize()
+    catalyst.finalize(mb)
     if rank == 0:
         os.remove("./tempcoproc.py")
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

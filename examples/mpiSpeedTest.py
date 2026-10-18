@@ -3,76 +3,69 @@
 
 A time trial test for testing and stuff.
 
+Writes the case: a periodic box of nbi^3 blocks of ni^3 nodes of still air,
+as g.h5, q.00000000.h5 and peregrine.yaml. The trial is the executable on
+as many ranks as the grid is partitioned for, and its timing is what the
+report plugin prints at the end:
+
+    peregrine partition g.h5 -ranks 64 -ranks_per_node 4
+    mpiexec -n 64 peregrine run peregrine.yaml g.h5 -b <backend>
 
 """
 
-import peregrinepy as pg
+import peregrine as pg
 import numpy as np
-import os
+
+# a calorically perfect air, stated in full: the library carries no such species
+air = {
+    "Air": {
+        "MW": 28.97,
+        "cp0": 1002.838449439523,
+        "mu0": 1.8591191080521142e-05,
+        "kappa0": 0.02625394405190068,
+    }
+}
+
 
 np.seterr(all="raise")
 
 
 def simulate():
-    config = pg.files.configFile()
-    config["RHS"]["diffusion"] = True
-    config["RHS"]["shockHandling"] = "artificialDissipation"
-    config["RHS"]["switchAdvFlux"] = "jamesonPressure"
-    config["RHS"]["secondaryAdvFlux"] = "scalarDissipation"
-    config["thermochem"]["spdata"] = ["Air"]
-
-    config["io"]["niterRestart"] = 1000000
-    config["io"]["niterPrint"] = 1000000
+    config = pg.Config()
+    config["simulation"]["simulator"] = "navier-stokes"
+    config["mixture"]["species"] = air
+    config["mixture"]["trans"] = "constant"
 
     config["simulation"]["niter"] = 100
 
-    config["timeIntegration"]["integrator"] = "rk3"
-    config["timeIntegration"]["variableTimeStep"] = True
-    config.validateConfig()
+    config["time-integration"]["integrator"] = "tvd-rk3"
+    config["simulation"]["controller"] = "cfl"
+    # the run prints nothing but its plugins: the report's closing lines are the trial's wall time and seconds per step per cell
+    config["plugins"]["report"] = {"niter-out": config["simulation"]["niter"]}
+    config.validate()
 
     ni = 30
     nbi = 10
-    mb = pg.multiBlock.restart(nbi**3, config["thermochem"]["spdata"])
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[nbi, nbi, nbi],
-        dimsPerBlock=[ni, ni, ni],
+    # a single species: the primitive variables are p, u, v, w, T
+    iovars = pg.simulator.get_simulator(config).iovars.minimal
+    mb = pg.multiblock.Restart(len(iovars.privars))
+    pg.mesher.CubeMesher(
+        mbdims=[nbi, nbi, nbi],
+        blkdims=[ni, ni, ni],
         lengths=[1, 1, 1],
         periodic=[True, True, True],
-    )
+    ).fill(mb)
 
-    for blk in mb:
-        blk.array["q"][:, :, :, 0] = 101325.0
-        blk.array["q"][:, :, :, 4] = 300.0
+    for blk in mb.blocks:
+        q = blk.q.get()
+        q[:, :, :, 0] = 101325.0
+        q[:, :, :, 4] = 300.0
+        blk.q.set(q)
 
-    # Create the case structure
-    try:
-        os.mkdir("./Grid")
-    except FileExistsError:
-        pass
-    try:
-        os.mkdir("./Restart")
-    except FileExistsError:
-        pass
-    try:
-        os.mkdir("./Input")
-    except FileExistsError:
-        pass
-
-    pg.writers.writeGrid(mb, "./Grid")
-    pg.writers.writeRestart(mb, "./Restart", gridPath="../Grid", animate=False)
-    pg.writers.writeConfigFile(config, "./")
-    pg.writers.writeConnectivity(mb, "./Input")
-
-    bcFam = """---
-
-periodic:
-  bcType: periodicTrans
-  bcVals:
-    periodicSpan: 0.1
-    periodicAxis: [1, 0, 0]"""
-    with open("./Input/bcFams.yaml", "w") as f:
-        f.write(bcFam)
+    pg.writers.GridWriter(mb, "g.h5").write(mb)
+    # the result carries the config, so the trial can also start from it: peregrine run -r q.00000000.h5 -b <backend>
+    pg.writers.RestartWriter(mb, iovars, "q.{n:08d}.h5", "g.h5", cfg=config).write(mb, 0, 0.0)
+    pg.write_cfg(config, "peregrine.yaml")
 
 
 if __name__ == "__main__":

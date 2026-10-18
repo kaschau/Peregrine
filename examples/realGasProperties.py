@@ -3,40 +3,37 @@
 
 Real gas properties.
 
+    python examples/realGasProperties.py <backend>
+
 """
 
 from mpi4py import MPI  # noqa: F401
-import peregrinepy as pg
+import sys
+import peregrine as pg
 import numpy as np
 import matplotlib.pyplot as plt
 
 
-def simulate():
-    config = pg.files.configFile()
-    config["RHS"]["diffusion"] = True
-    config["thermochem"]["eos"] = "cubic"
-    config["thermochem"]["spdata"] = ["CO2"]
-    config["thermochem"]["trans"] = "chungDenseGasUnityLewis"
-    config.validateConfig()
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=[2, 2, 2],
+def simulate(name):
+    config = pg.Config()
+    config["simulation"]["simulator"] = "navier-stokes"
+    config["mixture"]["eos"] = "real-gas"
+    config["mixture"]["species"] = ["CO2"]
+    config["mixture"]["trans"] = "chung"
+    config["mixture"]["T-range"] = (300.0, 2000.0)
+    config.validate()
+    backend = pg.get_backend(name, config)
+    # one block, periodic every way, so no boundary needs naming
+    mesh = pg.mesher.CubeMesher(
+        mbdims=[1, 1, 1],
+        blkdims=[2, 2, 2],
         lengths=[0.01, 0.01, 0.01],
+        periodic=[True, True, True],
     )
-    mb.initSolverArrays(config)
+    mb = pg.get_solver(config, mesh, backend)
 
-    blk = mb[0]
+    blk = mb.blocks[0]
     ng = blk.ng
-    for face in blk.faces:
-        face.bcType = "adiabaticNoSlipWall"
-
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-
-    mb.computeMetrics()
 
     ps = np.linspace(25, 35, 3)
     Ts = np.linspace(600, 1600, 100)
@@ -49,29 +46,29 @@ def simulate():
     mus = np.zeros((len(ps), len(Ts)))
     kappas = np.zeros((len(ps), len(Ts)))
 
+    # the primitive vector, p, u, v, w, T, at rest
+    q = np.zeros(blk.Q.shape[:3] + (mb.sim.ne,))
     for j, p in enumerate(ps):
         for i, T in enumerate(Ts):
-            # set the gas state
-            blk.array["q"][:, :, :, 0] = p * 1e6
-            blk.array["q"][:, :, :, 4] = T
+            # the state, and everything derived from it, at this p and T
+            q[:, :, :, 0] = p * 1e6
+            q[:, :, :, 4] = T
+            mb.set_prims([q])
 
-            # Update cons
-            blk.updateDeviceView(["q"])
-            mb.eos(blk, mb.thtrdat, 0, "prims")
-            # Update transport
-            mb.trans(blk, mb.thtrdat, 0)
+            Q, state, trstate = blk.Q.get(), blk.state.get(), blk.trstate.get()
+            # the eos's state at the cell by field; h = e + p / rho
+            s = dict(zip(mb.sim.statefields, state[ng, ng, ng]))
+            rhos[j, i] = Q[ng, ng, ng, 0]
+            cps[j, i] = s["cp"]
+            hs[j, i] = s["e"] + s["p"] / s["rho"]
+            cs[j, i] = s["c"]
 
-            blk.updateHostView(["Q", "qh", "qt"])
-            rhos[j, i] = blk.array["Q"][ng, ng, ng, 0]
-            cps[j, i] = blk.array["qh"][ng, ng, ng, 1]
-            hs[j, i] = blk.array["qh"][ng, ng, ng, 2]
-            cs[j, i] = blk.array["qh"][ng, ng, ng, 3]
-
-            mus[j, i] = blk.array["qt"][ng, ng, ng, 0]
-            kappas[j, i] = blk.array["qt"][ng, ng, ng, 1]
+            # the transport state: mu, kappa, then a diffusivity per species
+            mus[j, i] = trstate[ng, ng, ng, 0]
+            kappas[j, i] = trstate[ng, ng, ng, 1]
 
     fig, axs = plt.subplots(2, 2, sharex=True)
-    fig.suptitle(f"Thermo Properties of {config['thermochem']['spdata'][0]}")
+    fig.suptitle(f"Thermo Properties of {config['mixture']['species'][0]}")
     axs[0, 0].set_ylabel("rho [kg/m^3]")
     axs[0, 1].set_ylabel("Cp [J/kg.K]")
     axs[1, 0].set_ylabel("h [J/kg]")
@@ -88,10 +85,10 @@ def simulate():
         ax.grid()
     plt.show()
 
-    fig.suptitle(f"Transport Properties of {config['thermochem']['spdata'][0]}")
     fig, (ax1, ax2) = plt.subplots(2, sharex=True)
+    fig.suptitle(f"Transport Properties of {config['mixture']['species'][0]}")
     ax2.set_xlabel("Temperature [K]")
-    ax1.set_ylabel("Thermal Cond. [W/m^2.K]")
+    ax1.set_ylabel("Thermal Cond. [W/m.K]")
     ax2.set_ylabel("Viscosity [Pa.s]")
     for i, p in enumerate(ps):
         ax1.plot(Ts, kappas[i, :], label=f"p={p} MPa")
@@ -101,16 +98,14 @@ def simulate():
     ax1.legend()
     ax2.legend()
     plt.show()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

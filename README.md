@@ -2,63 +2,39 @@
 
 <p align="center">
     <picture>
-      <source media="(prefers-color-scheme: dark)" width="800" srcset="docs/images/pgSplashD2.jpg">
-      <source media="(prefers-color-scheme: light)" width="800" srcset="docs/images/pgSplashL2.jpg">
-      <img alt="peregrine logo" width="800" src="docs/images/pgSplashL2.jpg">
+      <source media="(prefers-color-scheme: dark)" width="800" srcset="docs/images/pgSplashD.jpg">
+      <source media="(prefers-color-scheme: light)" width="800" srcset="docs/images/pgSplashL.jpg">
+      <img alt="peregrine logo" width="800" src="docs/images/pgSplashL.jpg">
     </picture>
 </p>
 
 ## About
 
-PEREGRINE is a second order, multiblock, structured-grid multiphysics, finite volume, 3D CFD solver. The main novelty of PEREGRINE is its implementation in [Python](https://www.python.org) for ease of development and use of [Kokkos](https://www.github.com/kokkos/kokkos) for performance portability. If you are unfamiliar with Kokkos, do a little digging, it is a great project with a healthy community and helpful developers. The TLDR; Kokkos is a C++ library (not a C++ language extension) that exposes useful abstractions for data management (i.e. multidimensional arrays) and kernel execution from CPU-Serial to GPU-Parallel. This allows a single source, multiple architecture, approach in PEREGRINE. In other words, you can run a case with PEREGRINE on your laptop, then without changing a single line of source code, run the same case on a AMD GPU based super computer. PEREGRINE is massively parallel inter-node via MPI communication.
+PEREGRINE is a multiblock, structured-grid, finite volume, 3D
+multiphysics CFD solver: the Euler and Navier-Stokes equations of a
+multi-species gas, with thermally perfect and real-gas equations of state,
+kinetic-theory transport, and finite-rate chemistry from a Cantera
+mechanism. The case is described and driven in
+[Python](https://www.python.org) and runs on the host's CPUs with OpenMP,
+on an NVIDIA GPU, or on an AMD GPU, so one source runs a case on a laptop
+and, without a line changed, on a GPU supercomputer. PEREGRINE is parallel
+across nodes by MPI.
 
 ## Installation
 
-You must first install [Kokkos](https://www.github.com/kokkos/kokkos) and set the environment variable `Kokkos_DIR=/path/to/kokkos/install`. The Kokkos installation controls the Host/Device + Serial/Parallel execution parameters, there are no settings for the python installation.
-
-## Easy Install
-For editable python installation:
-
-``` pip install -e . ```
-
-Note, installation with pip is hard coded to Debug mode. I can't figure out how to make that an option.
-
-## Recommended Install
-For development, it is better to set the environment variable `PYTHONPATH` to point to `/path/to/PEREGRINE/src/` followed by manual installation of the C++ `compute` module:
-
-```cd /path/to/PEREGRINE; mkdir build; cd build; ccmake ../; make -j install```
-
-To generate compile_commands.json, 
-
-``` cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../ ```
+A C++ compiler with OpenMP (on macOS `brew install libomp`), then
+`pip install -e .` from the checkout; an NVIDIA GPU adds the CUDA
+toolkit, an AMD GPU ROCm. Every kernel a case needs is compiled at first
+use into `~/.cache/peregrine`. See [installing](docs/install.md) for the
+dependencies, parallel HDF5 and profiling.
 
 ## Documentation
 
-See the documentation [here](./docs/documentation.md).
-
-## Profiling GPU via NVTX
-Download and install the libraries found at [here](https://github.com/kokkos/kokkos-tools). At runtime, ensure the environment variable
-
-    $ export KOKKOS_PROFILE_LIBRARY=/path/to/kokkos-tools/kp_nvprof_connector.so
-
-is set. Finally, run the simulation with nsys enabling cuda,nvtx trace options.
-
-    jsrun -p 1 -g 1 nsys profile -o outPutName --trace cuda,nvtx  -f true --stats=false python -m mpi4py pgScript.py
-
-## Performance
-
-PEREGRINE is pretty fast by default. However, when running a simulation with multiple chemical species, it is recommended to turn on `PEREGRINE_NSCOMPILE` in cmake, and then specify the value of `numSpecies`. This will hard code `ns` at compile time, and gives a considerable performance improvement for EOS/transport calculations.
-
-## Parallel I/O 
-
-Parallel I/O can be achieved with a parallel capable h5py installation. 
-
-    $ export CC=mpicc
-    $ export HDF5_MPI="ON"
-    $ export HDF5_DIR="/path/to/parallel/hdf5"  # If this isn't found by default
-    $ pip install h5py --no-binary=h5py
-    
-`$HDF5_DIR` must point to a parallel enabled HDF5 installation. Parallel I/O is only applicable when running simulations with `config["io"]["lumpIO"]=true`.
+Start at the [documentation index](docs/README.md): how to
+[run a case](docs/running.md), the [config file](docs/config.md), the
+[mixture](docs/mixture.md), [boundary conditions](docs/boundaryConditions.md),
+[plugins](docs/plugins.md), and the [files](docs/files.md) PEREGRINE reads
+and writes.
 
 ## Attribution
 

@@ -3,13 +3,27 @@
 
 Couette Flow with top wall moving at 5m/s
 
+    python examples/couetteFlow.py <backend>
+
 """
 
 from mpi4py import MPI  # noqa: F401
 
-import peregrinepy as pg
+import sys
+
+import peregrine as pg
 import numpy as np
 import matplotlib.pyplot as plt
+
+# a calorically perfect air, stated in full: the library carries no such species
+air = {
+    "Air": {
+        "MW": 28.97,
+        "cp0": 1002.838449439523,
+        "mu0": 1.8591191080521142e-05,
+        "kappa0": 0.02625394405190068,
+    }
+}
 
 
 def analytical(y, h, t, nu, wallSpeed):
@@ -29,7 +43,7 @@ def analytical(y, h, t, nu, wallSpeed):
     )
 
 
-def simulate(index, velo):
+def simulate(name, index, velo):
     wallSpeed = 5.0
     nx = 50
     h = 0.025
@@ -43,117 +57,50 @@ def simulate(index, velo):
     elif index == "k":
         assert ("y" in velo) or ("x" in velo)
 
-    config = pg.files.configFile()
-    config["timeIntegration"]["dt"] = 10 * 1.0e-5 / nx
-    config["RHS"]["diffusion"] = True
-    config["thermochem"]["trans"] = "constantProps"
-    config["thermochem"]["spdata"] = ["Air"]
-    config.validateConfig()
+    config = pg.Config()
+    # the explicit step is the acoustic one, c dt/dx about 0.7, so this Mach 0.015 case takes two million of them
+    config["simulation"]["dt"] = 1e-6
+    config["simulation"]["simulator"] = "navier-stokes"
+    config["mixture"]["trans"] = "constant"
+    config["mixture"]["species"] = air
 
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
     rot = {"i": 0, "j": 1, "k": 2}
 
     def rotate(li, index):
         return li[-rot[index] :] + li[: -rot[index]]
 
-    dimsPerBlock = rotate([nx, 2, 2], index)
+    blkdims = rotate([nx, 2, 2], index)
     lengths = rotate([h, 0.001, 0.001], index)
+    flowAxis = "xyz".index(velo[-1])
+    flowVelocity = "uvw"[flowAxis]
+    periodic = [n == flowAxis for n in range(3)]
 
-    if "x" in velo:
-        periodic = [True, False, False]
-    elif "y" in velo:
-        periodic = [False, True, False]
-    elif "z" in velo:
-        periodic = [False, False, True]
+    # the low side of the wall-normal axis is still, the high side moves,
+    # and the sides across the flow slip
+    wallAxis = rot[index]
+    still, moving = 2 * wallAxis + 1, 2 * wallAxis + 2
+    bcnames = {n: "slip" for n in range(1, 7)}
+    bcnames[still], bcnames[moving] = "still", "moving"
+    wallVelocity = {c: wallSpeed if c == flowVelocity else 0.0 for c in "uvw"}
+    config["bcvals"]["still"] = {"kind": "no-slp-adia-wall"}
+    config["bcvals"]["moving"] = {"kind": "mov-adia-wall", **wallVelocity}
+    config["bcvals"]["slip"] = {"kind": "slp-adia-wall"}
+    config.validate()
+    backend = pg.get_backend(name, config)
 
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=dimsPerBlock,
+    mesh = pg.mesher.CubeMesher(
+        mbdims=[1, 1, 1],
+        blkdims=blkdims,
         lengths=lengths,
         periodic=periodic,
+        bcnames=bcnames,
     )
-
-    mb.initSolverArrays(config)
-
-    blk = mb[0]
-
-    if index == "i":
-        blk.getFace(1).bcType = "adiabaticNoSlipWall"
-        blk.getFace(2).bcType = "adiabaticMovingWall"
-        if "y" in velo:
-            blk.getFace(3).commRank = 0
-            blk.getFace(4).commRank = 0
-            for face in [5, 6]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-        else:
-            blk.getFace(5).commRank = 0
-            blk.getFace(6).commRank = 0
-            for face in [3, 4]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-    elif index == "j":
-        blk.getFace(3).bcType = "adiabaticNoSlipWall"
-        blk.getFace(4).bcType = "adiabaticMovingWall"
-        if "x" in velo:
-            blk.getFace(1).commRank = 0
-            blk.getFace(2).commRank = 0
-            for face in [5, 6]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-        else:
-            blk.getFace(5).commRank = 0
-            blk.getFace(6).commRank = 0
-            for face in [1, 2]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-    elif index == "k":
-        blk.getFace(5).bcType = "adiabaticNoSlipWall"
-        blk.getFace(6).bcType = "adiabaticMovingWall"
-        if "x" in velo:
-            blk.getFace(1).commRank = 0
-            blk.getFace(2).commRank = 0
-            for face in [3, 4]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-        else:
-            blk.getFace(3).commRank = 0
-            blk.getFace(4).commRank = 0
-            for face in [1, 2]:
-                blk.getFace(face).bcType = "adiabaticSlipWall"
-    else:
-        raise ValueError()
-
-    if "x" in velo:
-        valueDict = {"u": wallSpeed, "v": 0.0, "w": 0.0}
-    elif "y" in velo:
-        valueDict = {"u": 0.0, "v": wallSpeed, "w": 0.0}
-    elif "z" in velo:
-        valueDict = {"u": 0.0, "v": 0.0, "w": wallSpeed}
-    else:
-        raise ValueError()
-    for face in blk.faces:
-        if face.bcType == "adiabaticMovingWall":
-            face.array["qBcVals"] = np.zeros(blk.array["q"][face.s1_].shape)
-            pg.bcs.prepWalls.prep_adiabaticMovingWall(blk, face, valueDict)
-            pg.misc.createViewMirrorArray(
-                face, "qBcVals", blk.array["q"][face.s1_].shape
-            )
-            break
-
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-    mb.computeMetrics()
-
+    mb = pg.get_solver(config, mesh, backend)
+    blk = mb.blocks[0]
     ng = blk.ng
-    blk.array["q"][:, :, :, 0] = 101325.0
-    blk.array["q"][:, :, :, 1:4] = 0.0
-    blk.array["q"][:, :, :, 4] = 300.0
 
-    blk.updateDeviceView(["q"])
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
-
-    mu = np.unique(mb.thtrdat.array["mu0"])[0]
-    blk.updateHostView(["Q"])
-    rho = np.unique(blk.array["Q"][:, :, :, 0])[0]
+    mu = air["Air"]["mu0"]
+    rho = blk.Q.get()[ng, ng, ng, 0]
     nu = mu / rho
 
     if index == "i":
@@ -162,48 +109,39 @@ def simulate(index, velo):
         s_ = np.s_[ng, ng:-ng, ng]
     elif index == "k":
         s_ = np.s_[ng, ng, ng:-ng]
-    ccArray = {"i": "xc", "j": "yc", "k": "zc"}
-    if "x" in velo:
-        uIndex = 1
-    elif "y" in velo:
-        uIndex = 2
-    elif "z" in velo:
-        uIndex = 3
-    else:
-        raise ValueError()
-
-    xc = blk.array[ccArray[index]][s_]
-    sU_ = s_ + (uIndex,)
+    xc = blk.xcc.get()[..., wallAxis][s_]
 
     outputTimes = [0.0005, 0.005, 0.05]
     doneOutput = [False for _ in range(len(outputTimes))]
     outputU = []
     simTme = max(outputTimes) * h**2 / nu
-    while mb.tme < simTme:
-        mb.step(config["timeIntegration"]["dt"])
+    bar = pg.misc.Progress(simTme)
+    while mb.tme.get() < simTme:
+        mb.step(config["simulation"]["dt"])
 
-        if mb.nrt % 200 == 0:
-            pg.misc.progressBar(mb.tme, simTme)
-            blk.updateHostView(["Q"])
-            if np.any(np.isnan(blk.array["Q"])):
+        if mb.nrt % 20 == 0:
+            bar.at(mb.tme.get())
+            if np.any(np.isnan(blk.Q.get())):
                 raise ValueError("Nan detected")
 
         for i, oT in enumerate(outputTimes):
             t = oT * h**2 / nu
-            if mb.tme >= t and not doneOutput[i]:
-                blk.updateHostView(["q"])
-                outputU.append(blk.array["q"][sU_].copy())
+            if mb.tme.get() >= t and not doneOutput[i]:
+                outputU.append(mb.sim.iovars.data(blk, [flowVelocity])[flowVelocity][s_])
                 doneOutput[i] = True
 
     # Analytical solution
     yplot = np.linspace(0, h, 100)
     anSol = []
-    for oT in outputTimes:
+    for oT, oU in zip(outputTimes, outputU):
         sol = []
         for yy in yplot:
             t = oT * h**2 / nu
             sol.append(analytical(yy, h, t, nu, wallSpeed))
         anSol.append(np.array(sol))
+        exact = np.array([analytical(yy, h, t, nu, wallSpeed) for yy in xc])
+        err = np.abs(oU - exact).max() / abs(wallSpeed)
+        print(f"t nu/h^2 = {oT}: max |u - exact| / U = {err:.3e}")
 
     fig, ax1 = plt.subplots()
     ax1.grid(True, linestyle="--")
@@ -230,18 +168,16 @@ def simulate(index, velo):
     ax1.legend(title=r"$h^2t/\nu$")
     plt.show()
     plt.close()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
         index = "j"
         velo = "+z"
-        pg.compute.pgkokkos.initialize()
-        simulate(index, velo)
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1], index, velo)
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

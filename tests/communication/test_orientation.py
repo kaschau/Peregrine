@@ -1,714 +1,124 @@
 import itertools
-import peregrinepy as pg
+
 import numpy as np
 import pytest
 
+import peregrine as pg
+from peregrine.partition import Conditioner
 
-class twoblock123:
-    def __init__(self, adv, spdata):
-        self.config = pg.files.configFile()
-        self.config["RHS"]["primaryAdvFlux"] = adv
-        self.config["RHS"]["shockHandling"] = "hybrid"
-        self.config["RHS"]["secondaryAdvFlux"] = "rusanov"
+from tests.communication.test_xchg import configured, recons
 
-        self.config["RHS"]["diffusion"] = True
 
-        self.config["thermochem"]["spdata"] = spdata
-        self.mb = pg.multiBlock.generateMultiBlockSolver(2, self.config)
+# an orientation digit per axis of ours names the neighbour's axis it runs along: 1-3 for +i, +j, +k and 4-6 for -i, -j, -k
+def signedperm(S):
+    axes = tuple((int(d) - 1) % 3 for d in S)
+    flips = tuple(int(d) > 3 for d in S)
+    return axes, flips
 
-        pg.grid.create.multiBlockCube(
-            self.mb,
-            mbDims=[2, 1, 1],
-            dimsPerBlock=[6, 3, 2],
-            lengths=[2, 1, 1],
+
+def orientations():
+    valid = []
+    for axes in itertools.permutations((0, 1, 2)):
+        for signs in itertools.product((1, -1), repeat=3):
+            P = np.zeros((3, 3))
+            for m, (a, s) in enumerate(zip(axes, signs)):
+                P[m, a] = s
+            # the other 24 signed permutations are reflections, which no right handed grid can produce
+            if np.linalg.det(P) > 0:
+                valid.append(
+                    "".join(
+                        str(a + 1 + (3 if s < 0 else 0)) for a, s in zip(axes, signs)
+                    )
+                )
+    assert len(valid) == 24
+    return valid
+
+
+def reorient(a, S):
+    axes, flips = signedperm(S)
+    out = a
+    for m, f in enumerate(flips):
+        if f:
+            out = np.flip(out, axis=m)
+    return np.moveaxis(out, (0, 1, 2), axes)
+
+
+def unorient(a, S):
+    axes, flips = signedperm(S)
+    out = np.moveaxis(a, axes, (0, 1, 2))
+    for m, f in enumerate(flips):
+        if f:
+            out = np.flip(out, axis=m)
+    return out
+
+
+class ReorientedPair(pg.mesher.CubeMesher):
+    def __init__(self, S, **kwargs):
+        super().__init__(**kwargs)
+        self.S = S
+
+    def fill(self, mb):
+        super().fill(mb)
+        if self.S == "123":
+            return
+        axes, flips = signedperm(self.S)
+        # the partitioner takes the inverse: which old axis each new one holds, and which new ones run backwards
+        perm = [axes.index(m) for m in range(3)]
+        newflips = [flips[perm[m]] for m in range(3)]
+        Conditioner().reorient(mb, mb.get_blk(1), perm, newflips)
+
+
+VARLIST = ["nodes", "Q"]
+
+
+def traded(backend, S, recon, seed):
+    mesh = ReorientedPair(S, mbdims=[2, 1, 1], blkdims=[6, 3, 2], lengths=[2, 1, 1], defaultbc="wall")
+    config = configured(recon)
+    mb = pg.get_solver(config, mesh, backend(config))
+    assert mb.ng == recons[recon]
+
+    # drawn in the reference layout, so block 1 holds the same physical field however it is stored
+    rng = np.random.default_rng(seed)
+    # both blocks have the reference shape in the reference layout
+    for blk in mb.blocks:
+        values = rng.random(mb.blocks[0].Q.shape)
+        blk.Q.set(values if blk.nblki == 0 else reorient(values, S))
+
+    for var in VARLIST:
+        g = mb.backend.graph("test")
+        g.add_send("sent", var)
+        g.add_recv("landed", var)
+        g.bind(mb)
+        g.run()
+    return mb
+
+
+# the identity run is the ground truth, built once per depth
+_refs = {}
+
+
+def reference(backend, recon, seed):
+    if (recon, seed) not in _refs:
+        mb = traded(backend, "123", recon, seed)
+        ng = mb.ng
+        a, b = (blk.Q.get() for blk in mb.blocks)
+        # a trade that wrote nothing would pass the comparison below, so the landing itself is checked first
+        for g in range(ng):
+            assert np.array_equal(a[-ng + g, ng:-ng, ng:-ng], b[ng + g, ng:-ng, ng:-ng])
+        _refs[recon, seed] = (
+            {v: getattr(mb.blocks[0], v).get() for v in VARLIST},
+            {v: getattr(mb.blocks[1], v).get() for v in VARLIST},
         )
-
-        self.mb.initSolverArrays(self.config)
-        self.mb.generateHalo()
-        self.mb.computeMetrics()
-
-        blk0 = self.mb[0]
-        blk1 = self.mb[1]
-        blk0.getFace(2).commRank = 0
-        blk1.getFace(1).commRank = 0
-        ng = blk0.ng
-
-        self.xshape = self.mb[0].array["x"].shape
-        self.qshape = self.mb[0].array["q"].shape
-        self.phishape = self.mb[0].array["phi"].shape
-
-        self.varList = ["x", "y", "z", "q", "Q", "dqdx", "dqdy", "dqdz", "phi"]
-        self.varShapes = [
-            self.xshape,
-            self.xshape,
-            self.xshape,
-            self.qshape,
-            self.qshape,
-            self.qshape,
-            self.qshape,
-            self.qshape,
-            self.phishape,
-        ]
-        self.offsets = [1, 1, 1, 0, 0, 0, 0, 0, 0]
-        self.nLayers = [ng, ng, ng, ng, ng, 1, 1, 1, 1]
-
-        for blk in self.mb:
-            blk.array["x"][:] = np.random.random((self.xshape))
-            blk.array["y"][:] = np.random.random((self.xshape))
-            blk.array["z"][:] = np.random.random((self.xshape))
-            blk.array["q"][:] = np.random.random((self.qshape))
-            blk.array["Q"][:] = np.random.random((self.qshape))
-            blk.array["dqdx"][:] = np.random.random((self.qshape))
-            blk.array["dqdy"][:] = np.random.random((self.qshape))
-            blk.array["dqdz"][:] = np.random.random((self.qshape))
-            blk.array["phi"][:] = np.random.random((self.phishape))
-            blk.updateDeviceView(self.varList)
-
-
-pytestmark = pytest.mark.parametrize(
-    "adv,spdata",
-    list(
-        itertools.product(
-            ("KEEPpe", "fourthOrderKEEP"),
-            (["Air"], "thtr_CH4_O2_FFCMY.yaml"),
-        )
-    ),
-)
-
-
-class TestOrientation:
-    @classmethod
-    def setup_class(self):
-        pass
-
-    @classmethod
-    def teardown_class(self):
-        pass
-
-    ##############################################
-    # Test for all positive i aligned orientations
-    ##############################################
-    def test_123(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        # Reorient and update communication info
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        passfail = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = ng + off
-            b1rs = ng - 1
-            check0 = True
-            check1 = True
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss - i, j, k]
-                            == blk1.array[var][b1rs - i, j, k]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs + i, j, k]
-                            == blk1.array[var][b1ss + i, j, k]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            passfail.append(check0)
-            passfail.append(check1)
-
-        assert False not in passfail
-
-    def test_135(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(
-                np.flip(blk1.array[var], axis=2), (0, 1, 2), (0, 2, 1)
-            )
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.nj = tb.xshape[2] - 2 * ng
-        blk1.nk = tb.xshape[1] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "135"
-        blk1.getFace(1).orientation = "162"
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = ng + off
-            b1rs = ng - 1
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k]
-                            == blk1.array[var][b1rs, -(k + 1), j]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k]
-                            == blk1.array[var][b1ss, -(k + 1), j]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    def test_162(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(
-                np.flip(blk1.array[var], axis=1), (0, 1, 2), (0, 2, 1)
-            )
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.nj = tb.xshape[2] - 2 * ng
-        blk1.nk = tb.xshape[1] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "162"
-        blk1.getFace(1).orientation = "135"
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = ng + off
-            b1rs = ng - 1
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k]
-                            == blk1.array[var][b1rs, k, -(j + 1)]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k]
-                            == blk1.array[var][b1ss, k, -(j + 1)]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    ##############################################
-    # Test for all positive j aligned orientations
-    ##############################################
-    def test_231(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(blk1.array[var], (0, 1, 2), (1, 2, 0))
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.ni = tb.xshape[2] - 2 * ng
-        blk1.nj = tb.xshape[0] - 2 * ng
-        blk1.nk = tb.xshape[1] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "231"
-
-        blk1.getFace(1).neighbor = None
-        blk1.getFace(1).bcType = "adiabaticSlipWall"
-        blk1.getFace(1).orientation = None
-        blk1.getFace(1).commRank = None
-
-        blk1.getFace(3).neighbor = 0
-        blk1.getFace(3).bcType = "b0"
-        blk1.getFace(3).orientation = "312"
-        blk1.getFace(3).commRank = 0
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = ng + off
-            b1rs = ng - 1
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k] == blk1.array[var][k, b1rs, j]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k] == blk1.array[var][k, b1ss, j]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    ##############################################
-    # Test for all positive k aligned orientations
-    ##############################################
-    def test_312(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(blk1.array[var], (0, 1, 2), (2, 0, 1))
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.ni = tb.xshape[1] - 2 * ng
-        blk1.nj = tb.xshape[2] - 2 * ng
-        blk1.nk = tb.xshape[0] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "312"
-
-        blk1.getFace(1).neighbor = None
-        blk1.getFace(1).bcType = "adiabaticSlipWall"
-        blk1.getFace(1).orientation = None
-        blk1.getFace(1).commRank = None
-
-        blk1.getFace(5).neighbor = 0
-        blk1.getFace(5).bcType = "b0"
-        blk1.getFace(5).orientation = "231"
-        blk1.getFace(5).commRank = 0
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = ng + off
-            b1rs = ng - 1
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k] == blk1.array[var][j, k, b1rs]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k] == blk1.array[var][j, k, b1ss]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    ##############################################
-    # Test for all negative i aligned orientations
-    ##############################################
-    def test_432(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(blk1.array[var], (0, 1, 2), (0, 2, 1))
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.ni = tb.xshape[0] - 2 * ng
-        blk1.nj = tb.xshape[2] - 2 * ng
-        blk1.nk = tb.xshape[1] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "432"
-
-        blk1.getFace(1).neighbor = None
-        blk1.getFace(1).bcType = "adiabaticSlipWall"
-        blk1.getFace(1).orientation = None
-        blk1.getFace(1).commRank = None
-
-        blk1.getFace(2).neighbor = 0
-        blk1.getFace(2).bcType = "b0"
-        blk1.getFace(2).orientation = "432"
-        blk1.getFace(2).commRank = 0
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = b0ss
-            b1rs = b0rs
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k] == blk1.array[var][b1rs, k, j]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k] == blk1.array[var][b1ss, k, j]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    ##############################################
-    # Test for all negative j aligned orientations
-    ##############################################
-    def test_513(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(blk1.array[var], (0, 1, 2), (1, 0, 2))
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.ni = tb.xshape[1] - 2 * ng
-        blk1.nj = tb.xshape[0] - 2 * ng
-        blk1.nk = tb.xshape[2] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "513"
-
-        blk1.getFace(1).neighbor = None
-        blk1.getFace(1).bcType = "adiabaticSlipWall"
-        blk1.getFace(1).orientation = None
-        blk1.getFace(1).commRank = None
-
-        blk1.getFace(4).neighbor = 0
-        blk1.getFace(4).bcType = "b0"
-        blk1.getFace(4).orientation = "243"
-        blk1.getFace(4).commRank = 0
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = b0ss
-            b1rs = b0rs
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k] == blk1.array[var][j, b1rs, k]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k] == blk1.array[var][j, b1ss, k]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
-
-    ##############################################
-    # Test for all negative k aligned orientations
-    ##############################################
-    def test_621(self, my_setup, adv, spdata):
-        tb = twoblock123(adv, spdata)
-
-        blk0 = tb.mb[0]
-        blk1 = tb.mb[1]
-        ng = blk0.ng
-
-        for var in tb.varList:
-            blk1.array[var] = np.moveaxis(blk1.array[var], (0, 1, 2), (2, 1, 0))
-
-        # HACK: It seems like previous test data still exists
-        # We need to clear out residual arrays from previous tests
-        for v in blk0.array.keys():
-            if v not in tb.varList:
-                blk0.array[v] = None
-                blk0.mirror[v] = None
-                blk1.array[v] = None
-                blk1.mirror[v] = None
-
-        blk1.ni = tb.xshape[2] - 2 * ng
-        blk1.nj = tb.xshape[1] - 2 * ng
-        blk1.nk = tb.xshape[0] - 2 * ng
-
-        # Reorient second block and update communication info
-        blk0.getFace(2).orientation = "621"
-
-        blk1.getFace(1).neighbor = None
-        blk1.getFace(1).bcType = "adiabaticSlipWall"
-        blk1.getFace(1).orientation = None
-        blk1.getFace(1).commRank = None
-
-        blk1.getFace(6).neighbor = 0
-        blk1.getFace(6).bcType = "b0"
-        blk1.getFace(6).orientation = "324"
-        blk1.getFace(6).commRank = 0
-
-        tb.mb.setBlockCommunication()
-        tb.mb.initSolverArrays(tb.config)
-        # Execute communication
-        for blk in tb.mb:
-            blk.updateDeviceView(tb.varList)
-        pg.mpiComm.communicate(tb.mb, tb.varList)
-        for blk in tb.mb:
-            blk.updateHostView(tb.varList)
-
-        b02b1 = []
-        b12b0 = []
-        for var, shape, off, nLayers in zip(
-            tb.varList,
-            tb.varShapes,
-            tb.offsets,
-            tb.nLayers,
-        ):
-            # halo starting indicies (march from inner out)
-            b0ss = -(ng + 1) - off
-            b0rs = -ng
-            b1ss = b0ss
-            b1rs = b0rs
-            check0 = True
-            check1 = True
-            shape = blk0.array[var].shape
-            for i in range(nLayers):
-                for j in range(shape[1]):
-                    for k in range(shape[2]):
-                        check0 = np.all(
-                            blk0.array[var][b0ss, j, k] == blk1.array[var][k, j, b1rs]
-                        )
-                        check1 = np.all(
-                            blk0.array[var][b0rs, j, k] == blk1.array[var][k, j, b1ss]
-                        )
-                        if not check0 or not check1:
-                            break
-                    if not check0 or not check1:
-                        break
-                if not check0 or not check1:
-                    break
-            b02b1.append(check0)
-            b12b0.append(check1)
-
-        assert False not in b02b1
-        assert False not in b12b0
+    return _refs[recon, seed]
+
+
+@pytest.mark.parametrize("recon", list(recons))
+@pytest.mark.parametrize("S", orientations())
+def test_orientation(backend, S, recon):
+    seed = 20260901
+    ref0, ref1 = reference(backend, recon, seed)
+
+    mb = traded(backend, S, recon, seed)
+    for var in VARLIST:
+        assert np.array_equal(getattr(mb.blocks[0], var).get(), ref0[var]), (S, var, "blk0")
+        assert np.array_equal(getattr(mb.blocks[1], var).get(), reorient(ref1[var], S)), (S, var, "blk1")

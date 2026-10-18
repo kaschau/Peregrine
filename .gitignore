@@ -1,9 +1,22 @@
+# the compute library, wherever it is built
+legacy/*
 *.so
-build
+*.so.*
+*.dylib
+*.dll
+*.a
+*.o
+build*
 *egg*
 __pycache__
 .vscode
-compile_commands.json
 .cache
 TAGS
 .venv
+*.json
+.DS_Store
+# the bit gate's references: recorded at the start of a round, not carried
+tests/gate/references.yaml
+.*
+# the sem gate's references: recorded locally, not carried
+tests/sem/references/

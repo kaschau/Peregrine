@@ -8,46 +8,44 @@ https://doi.org/10.1016/j.jcp.2020.110060
 
 Should reproduce results in Fig. 2 for the KEEP scheme (blue line)
 
+    python examples/threeDTaylorGreen.py <backend>
 
 """
 
 from mpi4py import MPI  # noqa: F401
 
-import peregrinepy as pg
+import sys
+
+import peregrine as pg
 import numpy as np
 import matplotlib.pyplot as plt
+
+# the ideal gas the case assumes, stated in full
+air = {"Air": {"MW": 28.97, "cp0": 1000.0}}
+
 
 np.seterr(all="raise")
 
 
-def simulate():
-    config = pg.files.configFile()
-    config.validateConfig()
+def simulate(name):
+    config = pg.Config()
+    config["simulation"]["simulator"] = "euler"
+    config["mixture"]["species"] = air
+    config.validate()
+    backend = pg.get_backend(name, config)
 
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
     NE = 65
     NN = 65
     NX = 65
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=[NE, NN, NX],
+    mesh = pg.mesher.CubeMesher(
+        mbdims=[1, 1, 1],
+        blkdims=[NE, NN, NX],
         lengths=[2 * np.pi for _ in range(3)],
         periodic=[True, True, True],
     )
+    mb = pg.get_solver(config, mesh, backend)
 
-    mb.initSolverArrays(config)
-
-    blk = mb[0]
-    ng = blk.ng
-
-    for face in blk.faces:
-        face.commRank = 0
-
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-    mb.computeMetrics()
+    blk = mb.blocks[0]
 
     R = 287.002507
     cp = 1000.0
@@ -55,62 +53,41 @@ def simulate():
     M0 = 0.4
     rho0 = 1.0
     gamma = cp / (cp - R)
-    blk.array["q"][:, :, :, 0] = 1 / gamma + (rho0 * M0**2 / 16.0) * (
-        np.cos(2 * blk.array["xc"]) + np.cos(2 * blk.array["yc"])
-    ) * (np.cos(2 * blk.array["zc"] + 2.0))
-    blk.array["q"][:, :, :, 1] = (
-        M0 * np.sin(blk.array["xc"]) * np.cos(blk.array["yc"]) * np.cos(blk.array["zc"])
-    )
-    blk.array["q"][:, :, :, 2] = (
-        -M0
-        * np.cos(blk.array["xc"])
-        * np.sin(blk.array["yc"])
-        * np.cos(blk.array["zc"])
-    )
-    blk.array["q"][:, :, :, 4] = blk.array["q"][:, :, :, 0] / (R * rho0)
+    xc, yc, zc = (blk.xcc.get()[..., n] for n in range(3))
+    # the primitive vector, p, u, v, w, T
+    q = np.zeros(blk.Q.shape[:3] + (mb.sim.ne,))
+    q[:, :, :, 0] = 1 / gamma + (rho0 * M0**2 / 16.0) * (
+        np.cos(2 * xc) + np.cos(2 * yc)
+    ) * (np.cos(2 * zc) + 2.0)
+    q[:, :, :, 1] = M0 * np.sin(xc) * np.cos(yc) * np.cos(zc)
+    q[:, :, :, 2] = -M0 * np.cos(xc) * np.sin(yc) * np.cos(zc)
+    q[:, :, :, 4] = q[:, :, :, 0] / (R * rho0)
 
-    blk.updateDeviceView(["q"])
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
+    mb.set_prims([q])
 
     dt = 0.1 * 2 * np.pi / 64
     ke = []
     e = []
     s = []
     t = []
-    tEnd = 120.0 / M0
-    while mb.tme < tEnd:
+    tend = 120.0 / M0
+    bar = pg.misc.Progress(tend)
+    while mb.tme.get() < tend:
         if mb.nrt % 50 == 0:
-            pg.misc.progressBar(mb.tme, tEnd)
-            blk.updateHostView("q")
-            blk.updateHostView("Q")
-
-            rke = np.sum(
-                0.5
-                * blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                * (
-                    blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 1] ** 2
-                    + blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 2] ** 2
-                    + blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 3] ** 2
-                )
-            )
-            re = np.sum(
-                blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                * (blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 4] * cv)
+            bar.at(mb.tme.get())
+            data = mb.sim.iovars.data(blk, ["rho", "p", "u", "v", "w", "T"])
+            rho, p, u, v, w, T = (
+                data[n][blk.interior] for n in "rho p u v w T".split()
             )
 
-            rS = np.sum(
-                blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                * np.log10(
-                    blk.array["q"][ng:-ng, ng:-ng, ng:-ng, 0]
-                    * blk.array["Q"][ng:-ng, ng:-ng, ng:-ng, 0] ** (-gamma)
-                )
-            )
+            rke = np.sum(0.5 * rho * (u**2 + v**2 + w**2))
+            re = np.sum(rho * (T * cv))
+            rS = np.sum(rho * np.log10(p * rho ** (-gamma)))
 
             ke.append(rke)
             e.append(re)
             s.append(rS)
-            t.append(mb.tme * M0)
+            t.append(mb.tme.get() * M0)
 
         mb.step(dt)
 
@@ -127,16 +104,14 @@ def simulate():
     plt.plot(t, e / e[0])
     plt.savefig("e.png")
     plt.clf()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

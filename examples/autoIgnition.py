@@ -3,18 +3,21 @@
 
 Auto ignition flame calculation.
 
+    python examples/autoIgnition.py <backend>
+
 """
 
 from mpi4py import MPI  # noqa: F401
-import peregrinepy as pg
+import sys
+import peregrine as pg
 import cantera as ct
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 
-def simulate():
+def simulate(name):
     relpath = str(Path(__file__).parent)
-    ct.add_directory(relpath + "/../src/peregrinepy/thermoTransport/database/source")
+    ct.add_directory(relpath + "/../peregrine/simulator/mixture/database/mechanisms")
 
     # Cantera stuff
     T, p = 1100.0, 101325
@@ -27,45 +30,34 @@ def simulate():
     sim = ct.ReactorNet([r1])
 
     # PEREGRINE stuff
-    config = pg.files.configFile()
-    config["RHS"]["diffusion"] = False
-    config["timeIntegration"]["integrator"] = "rk4"
-    config["thermochem"]["chemistry"] = True
-    config["thermochem"]["mechanism"] = "chem_CH4_O2_FFCMY"
-    config["thermochem"]["nChemSubSteps"] = 10
-    config["thermochem"]["eos"] = "tpg"
-    config["thermochem"]["spdata"] = "thtr_CH4_O2_FFCMY.yaml"
-    config.validateConfig()
-    mb = pg.multiBlock.generateMultiBlockSolver(1, config)
-    pg.grid.create.multiBlockCube(
-        mb,
-        mbDims=[1, 1, 1],
-        dimsPerBlock=[2, 2, 2],
-        lengths=[0.01, 0.01, 0.01],
+    config = pg.Config()
+    config["simulation"]["simulator"] = "euler"
+    config["time-integration"]["integrator"] = "rk4"
+    config["mixture"]["chemistry"] = "finite-rate"
+    config["chem-integration"]["kind"] = "sub-stepped"
+    config["mixture"]["eos"] = "tpg"
+    config["mixture"]["species"] = "CH4_O2_FFCMY.yaml"
+    config["mixture"]["T-range"] = (300.0, 3500.0)
+    # the reactor's state, uniform over the block
+    config["ics"]["p"] = gas.P
+    config["ics"]["T"] = gas.T
+    config["ics"]["Y"] = {
+        s: y for s, y in zip(gas.species_names, gas.Y) if y > 0.0
+    }
+    # a closed box: every face a slip wall
+    config["bcvals"]["walls"] = {"kind": "slp-adia-wall"}
+    config.validate()
+    backend = pg.get_backend(name, config)
+    mesh = pg.mesher.CubeMesher(
+        mbdims=[1, 1, 1], blkdims=[2, 2, 2], lengths=[0.01, 0.01, 0.01], defaultbc="walls"
     )
-    mb.initSolverArrays(config)
+    mb = pg.get_solver(config, mesh, backend)
 
-    blk = mb[0]
+    blk = mb.blocks[0]
     ng = blk.ng
-    for face in blk.faces:
-        face.bcType = "adiabaticNoSlipWall"
-
-    mb.setBlockCommunication()
-
-    mb.unifyGrid()
-
-    mb.computeMetrics()
-
-    blk.array["q"][:, :, :, 0] = gas.P
-    blk.array["q"][:, :, :, 4] = gas.T
-    blk.array["q"][:, :, :, 5::] = gas.Y[0:-1]
-
-    # Update cons
-    mb.eos(blk, mb.thtrdat, 0, "prims")
-    pg.consistify(mb)
 
     dt = 1e-9
-    config["timeIntegration"]["dt"] = dt
+    config["simulation"]["dt"] = dt
     niterout = 1000
     pgT = []
     pgO2 = []
@@ -74,18 +66,19 @@ def simulate():
     t = []
     print(mb)
     print("Time   PEREGRINE  CANTERA")
-    while mb.tme < 0.05:
+    while mb.tme.get() < 0.05:
         if mb.nrt % niterout == 0:
-            pgT.append(blk.array["q"][ng, ng, ng, 4])
-            pgO2.append(blk.array["q"][ng, ng, ng, 7])
+            data = mb.sim.iovars.data(blk, ["T", "O2"])
+            pgT.append(data["T"][ng, ng, ng])
+            pgO2.append(data["O2"][ng, ng, ng])
             ctT.append(gas.T)
             ctO2.append(gas.Y[2])
-            t.append(mb.tme)
+            t.append(mb.tme.get())
 
-            print(f"{mb.tme:.2e} {blk.array['q'][ng,ng,ng,4]:.2f} {gas.T:.2f}")
+            print(f"{mb.tme.get():.2e} {pgT[-1]:.2f} {gas.T:.2f}")
 
         mb.step(dt)
-        sim.advance(mb.tme)
+        sim.advance(mb.tme.get())
 
     plt.plot(t, pgT, label="PEREGRINE")
     plt.plot(t, ctT, label="CANTERA")
@@ -97,16 +90,14 @@ def simulate():
     plt.title("O2")
     plt.legend()
     plt.show()
+    backend.stop()
 
 
 if __name__ == "__main__":
     try:
-        pg.compute.pgkokkos.initialize()
-        simulate()
-        pg.compute.pgkokkos.finalize()
+        simulate(sys.argv[1])
 
     except Exception as e:
-        import sys
         import traceback
 
         print(f"{e}")

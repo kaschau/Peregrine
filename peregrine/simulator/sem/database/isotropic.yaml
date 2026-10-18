@@ -1,0 +1,9 @@
+# Homogeneous isotropic turbulence: no wall, Uo everywhere, one length
+# scale, the scale factor, in every direction, and the identity Reynolds
+# stress tensor.
+profile:
+  law: uniform
+sigmas:
+  law: uniform
+stats:
+  law: isotropic
